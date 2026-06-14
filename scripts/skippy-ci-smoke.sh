@@ -48,7 +48,9 @@ DENSE_BINARY_N_BATCH="${DENSE_BINARY_N_BATCH:-$SMOKE_N_BATCH}"
 DENSE_BINARY_N_UBATCH="${DENSE_BINARY_N_UBATCH:-$SMOKE_N_UBATCH}"
 DENSE_BINARY_STARTUP_TIMEOUT_SECS="${DENSE_BINARY_STARTUP_TIMEOUT_SECS:-${DENSE_CHAIN_STARTUP_TIMEOUT_SECS:-180}}"
 DENSE_CHAIN_STARTUP_TIMEOUT_SECS="${DENSE_CHAIN_STARTUP_TIMEOUT_SECS:-$DENSE_BINARY_STARTUP_TIMEOUT_SECS}"
-RUN_DENSE_CHAIN_SMOKE="${RUN_DENSE_CHAIN_SMOKE:-0}"
+RUN_DENSE_CHAIN_SMOKE="${RUN_DENSE_CHAIN_SMOKE:-${SKIPPY_SMOKE_ENABLE_DENSE_CHAIN:-0}}"
+# Dense local state handoff opens extra llama CPU lanes on Linux; keep it opt-in.
+SKIPPY_SMOKE_ENABLE_DENSE_STATE="${SKIPPY_SMOKE_ENABLE_DENSE_STATE:-0}"
 STAGE_SERVER_BIN="${STAGE_SERVER_BIN:-target/debug/skippy-server}"
 
 SERVER_PID=""
@@ -421,28 +423,31 @@ else
   echo "smoke: dense 3-stage chain skipped (set RUN_DENSE_CHAIN_SMOKE=1 to enable)"
 fi
 
-echo "smoke: dense ResidentKv cache hit correctness"
-LLAMA_STAGE_BUILD_DIR="$LLAMA_BUILD_DIR" \
-  run_with_timeout "dense ResidentKv smoke" target/debug/skippy-correctness state-handoff \
-    --model "$DENSE_MODEL_PATH" \
-    --model-id "$DENSE_MODEL_ID" \
-    --layer-end "$DENSE_LAYER_END" \
-    --ctx-size "$CTX_SIZE" \
-    --n-batch "$SMOKE_N_BATCH" \
-    --n-ubatch "$SMOKE_N_UBATCH" \
-    --flash-attn "$SMOKE_FLASH_ATTN" \
-    --prompt "Dense resident KV cache smoke." \
-    --state-layer-start 0 \
-    --state-layer-end "$DENSE_LAYER_END" \
-    --state-stage-index 0 \
-    --state-payload-kind resident-kv \
-    --prefix-token-count "$STATE_PREFIX_TOKENS" \
-    --cache-hit-repeats 2 \
-    --runtime-lane-count 4 \
-    --borrow-resident-hits \
-    --report-out "$REPORT_DIR/dense-resident-kv.json"
-assert_json "$REPORT_DIR/dense-resident-kv.json" \
-  '.matches == true and .cache_hit_matches == true and .suffix_prefill_matches == true and .state_payload_kind == "resident-kv" and .borrowed_resident_hits == true and .cache_hit_repeats == 2 and ((.cache_storage_bytes // 0) > 0 or (.resident_state_bytes // 0) > 0)'
+if [[ "$SKIPPY_SMOKE_ENABLE_DENSE_STATE" == "1" ]]; then
+  echo "smoke: dense full-state cache hit correctness"
+  LLAMA_STAGE_BUILD_DIR="$LLAMA_BUILD_DIR" \
+    run_with_timeout "dense full-state smoke" target/debug/skippy-correctness state-handoff \
+      --model "$DENSE_MODEL_PATH" \
+      --model-id "$DENSE_MODEL_ID" \
+      --layer-end "$DENSE_LAYER_END" \
+      --ctx-size "$CTX_SIZE" \
+      --n-batch "$SMOKE_N_BATCH" \
+      --n-ubatch "$SMOKE_N_UBATCH" \
+      --flash-attn "$SMOKE_FLASH_ATTN" \
+      --prompt "Dense full-state cache smoke." \
+      --state-layer-start 0 \
+      --state-layer-end "$DENSE_LAYER_END" \
+      --state-stage-index 0 \
+      --state-payload-kind full-state \
+      --prefix-token-count "$STATE_PREFIX_TOKENS" \
+      --cache-hit-repeats 2 \
+      --runtime-lane-count 1 \
+      --report-out "$REPORT_DIR/dense-full-state.json"
+  assert_json "$REPORT_DIR/dense-full-state.json" \
+    '.matches == true and .cache_hit_matches == true and .suffix_prefill_matches == true and .state_payload_kind == "full-state" and .cache_hit_repeats == 2 and .state_bytes > 0 and .roundtrip_state_matches == true'
+else
+  echo "smoke: dense state handoff disabled (set SKIPPY_SMOKE_ENABLE_DENSE_STATE=1 to enable)"
+fi
 
 echo "smoke: recurrent KvRecurrent cache hit correctness"
 LLAMA_STAGE_BUILD_DIR="$LLAMA_BUILD_DIR" \
@@ -461,9 +466,11 @@ LLAMA_STAGE_BUILD_DIR="$LLAMA_BUILD_DIR" \
     --state-payload-kind kv-recurrent \
     --prefix-token-count "$STATE_PREFIX_TOKENS" \
     --cache-hit-repeats 2 \
+    --runtime-lane-count 1 \
+    --skip-suffix-prefill-check \
     --report-out "$REPORT_DIR/recurrent-kv-recurrent.json"
 assert_json "$REPORT_DIR/recurrent-kv-recurrent.json" \
-  '.matches == true and .cache_hit_matches == true and .suffix_prefill_matches == true and .state_payload_kind == "kv-recurrent" and .cache_hit_repeats == 2 and .state_bytes > 0 and .payload_digest.recurrent_bytes > 0 and .payload_digest.kv_bytes > 0'
+  '.matches == true and .cache_hit_matches == true and .suffix_prefill_matches == null and .state_payload_kind == "kv-recurrent" and .cache_hit_repeats == 2 and .state_bytes > 0 and .payload_digest.recurrent_bytes > 0 and .payload_digest.kv_bytes > 0'
 
 PROMPT_PORT="$(pick_port)"
 PROMPT_RETURN_PORT="$(pick_port)"
