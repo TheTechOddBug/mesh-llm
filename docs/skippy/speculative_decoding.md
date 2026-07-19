@@ -9,7 +9,7 @@ in the family result documents under this directory.
 N-gram speculative decoding is implemented and useful, especially for repeated
 coding/editing sessions. It is model-free: the pool observes accepted target
 tokens, proposes continuations when a context suffix repeats, and the staged
-target verifies every proposed token through `VerifySpan`.
+target verifies every proposed token through `VerifyWindow`.
 
 Current policy:
 
@@ -48,7 +48,7 @@ Open items:
 
 - Make repair decisions cost-aware, not only confidence/window-size aware.
 - Preserve the tail-reject fast path.
-- Avoid repair `VerifySpan` when a normal decode step is cheaper.
+- Avoid repair `VerifyWindow` when a normal decode step is cheaper.
 - Track repair cost by task type, not only globally.
 
 ### Pool Policy And Lifetime

@@ -1,6 +1,6 @@
 use super::*;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct OpenAiSpeculativeStats {
     pub(super) windows: usize,
     pub(super) draft_tokens: usize,
@@ -49,48 +49,95 @@ pub(super) struct OpenAiSpeculativeStats {
     pub(super) adaptive_window_enabled: bool,
 }
 
-/// Upper bound on the n-gram suffix length scanned during speculative
-/// proposal generation. Without a cap, `propose_ngram_tokens` performs a
-/// nested scan (`match_len` × `candidate_start` × per-candidate slice
-/// compare) over the full history, giving O(N³) worst case behavior. Real
-/// n-gram repeats beyond a handful of tokens are vanishingly rare, so
-/// bounding the outer match loop at this many tokens keeps the scan
-/// tractable on long contexts without losing useful proposals.
-const MAX_NGRAM_MATCH: usize = 32;
-
+/// Uses llama.cpp's ngram-simple self-speculative proposer. The accepted
+/// history includes the current token; the upstream API keeps it separate
+/// from the preceding history internally.
 pub(super) fn propose_ngram_tokens(
     history: &[i32],
     min_match_tokens: usize,
     max_proposed_tokens: usize,
-) -> Vec<i32> {
-    if min_match_tokens == 0 || max_proposed_tokens == 0 || history.len() < min_match_tokens * 2 {
-        return Vec::new();
-    }
-    let upper_match = (history.len() / 2).min(MAX_NGRAM_MATCH);
-    let start_match = min_match_tokens.min(upper_match);
-    for match_len in (start_match..=upper_match).rev() {
-        let suffix_start = history.len() - match_len;
-        let suffix = &history[suffix_start..];
-        let latest_candidate_start = suffix_start.saturating_sub(match_len);
-        for candidate_start in (0..=latest_candidate_start).rev() {
-            let candidate_end = candidate_start + match_len;
-            if &history[candidate_start..candidate_end] != suffix {
-                continue;
-            }
-            let proposal_start = candidate_end;
-            let proposal_end = history.len().min(proposal_start + max_proposed_tokens);
-            if proposal_start < proposal_end {
-                return history[proposal_start..proposal_end].to_vec();
-            }
+) -> OpenAiResult<Vec<i32>> {
+    skippy_runtime::ngram_simple_draft(history, min_match_tokens, max_proposed_tokens)
+        .map_err(openai_backend_error)
+}
+
+/// Request-local, cache-based N-gram proposer. It mirrors only committed
+/// history into native state; speculative candidates remain read-only inputs.
+pub(super) struct CachedNgramProposer {
+    cache: skippy_runtime::NgramCache,
+    committed_history: Vec<i32>,
+}
+
+impl CachedNgramProposer {
+    pub(super) fn from_config(config: &SpeculativeDecodeConfig) -> OpenAiResult<Option<Self>> {
+        let Some(ngram) = config.ngram.as_ref() else {
+            return Ok(None);
+        };
+        if ngram.kind != NgramProposerKind::Cache {
+            return Ok(None);
         }
+        Self::new(ngram.min_ngram, ngram.max_ngram).map(Some)
     }
-    Vec::new()
+
+    pub(super) fn new(ngram_min: usize, ngram_max: usize) -> OpenAiResult<Self> {
+        let cache =
+            skippy_runtime::NgramCache::new(ngram_min, ngram_max).map_err(openai_backend_error)?;
+        Ok(Self {
+            cache,
+            committed_history: Vec::new(),
+        })
+    }
+
+    pub(super) fn propose(
+        &mut self,
+        committed_history: &[i32],
+        continuation_prefix: &[i32],
+        max_proposed_tokens: usize,
+    ) -> OpenAiResult<Vec<i32>> {
+        self.sync(committed_history)?;
+        self.cache
+            .draft_after(continuation_prefix, max_proposed_tokens)
+            .map_err(openai_backend_error)
+    }
+
+    fn sync(&mut self, committed_history: &[i32]) -> OpenAiResult<()> {
+        if committed_history.starts_with(&self.committed_history) {
+            let appended = &committed_history[self.committed_history.len()..];
+            self.cache.append(appended).map_err(openai_backend_error)?;
+        } else {
+            self.cache
+                .reset(committed_history)
+                .map_err(openai_backend_error)?;
+        }
+        self.committed_history.clear();
+        self.committed_history.extend_from_slice(committed_history);
+        Ok(())
+    }
 }
 
 impl OpenAiSpeculativeStats {
+    pub(super) fn insert_response_timings(&self, timings: &mut BTreeMap<String, Value>) {
+        timings.insert(
+            "verify_window_verify_elapsed_ms".to_string(),
+            json!(self.primary_verify_elapsed_ms),
+        );
+        timings.insert(
+            "verify_window_stage0_compute_ms".to_string(),
+            json!(self.primary_verify_stage0_compute_ms),
+        );
+        timings.insert(
+            "verify_window_forward_write_ms".to_string(),
+            json!(self.primary_verify_forward_write_ms),
+        );
+        timings.insert(
+            "verify_window_downstream_wait_ms".to_string(),
+            json!(self.primary_verify_downstream_wait_ms),
+        );
+    }
+
     pub(super) fn observe_verify_decision(
         &mut self,
-        decision: VerifySpanDecision,
+        decision: VerifyWindowDecision,
         adaptive_window: &mut usize,
         adaptive_enabled: bool,
         max_speculative_window: usize,
@@ -103,7 +150,7 @@ impl OpenAiSpeculativeStats {
         self.adaptive_window_min = nonzero_min(self.adaptive_window_min, *adaptive_window);
         self.adaptive_window_max_seen = self.adaptive_window_max_seen.max(*adaptive_window);
         match decision.kind {
-            VerifySpanDecisionKind::FullAccept => {
+            VerifyWindowDecisionKind::FullAccept => {
                 self.full_accept_windows += 1;
                 self.grow_adaptive_window(
                     adaptive_window,
@@ -111,10 +158,10 @@ impl OpenAiSpeculativeStats {
                     max_speculative_window,
                 );
             }
-            VerifySpanDecisionKind::AcceptedStop => {
+            VerifyWindowDecisionKind::AcceptedStop => {
                 self.accepted_stop_windows += 1;
             }
-            VerifySpanDecisionKind::TailReject => {
+            VerifyWindowDecisionKind::TailReject => {
                 self.observe_reject(decision);
                 self.tail_reject_windows += 1;
                 self.grow_adaptive_window(
@@ -123,13 +170,13 @@ impl OpenAiSpeculativeStats {
                     max_speculative_window,
                 );
             }
-            VerifySpanDecisionKind::EarlyReject => {
+            VerifyWindowDecisionKind::EarlyReject => {
                 self.observe_reject(decision);
                 self.early_reject_windows += 1;
                 self.repair_required_windows += 1;
                 self.shrink_adaptive_window(adaptive_window, adaptive_enabled, decision);
             }
-            VerifySpanDecisionKind::EarlyRejectStop => {
+            VerifyWindowDecisionKind::EarlyRejectStop => {
                 self.observe_reject(decision);
                 self.early_reject_windows += 1;
                 self.early_reject_stop_windows += 1;
@@ -137,7 +184,7 @@ impl OpenAiSpeculativeStats {
         }
     }
 
-    pub(super) fn observe_reject(&mut self, decision: VerifySpanDecision) {
+    pub(super) fn observe_reject(&mut self, decision: VerifyWindowDecision) {
         if let Some(repair_input_count) = decision.repair_input_count {
             self.rejected_windows += 1;
             self.first_reject_position_sum += repair_input_count;
@@ -160,7 +207,7 @@ impl OpenAiSpeculativeStats {
         &mut self,
         adaptive_window: &mut usize,
         adaptive_enabled: bool,
-        decision: VerifySpanDecision,
+        decision: VerifyWindowDecision,
     ) {
         if !adaptive_enabled {
             return;
@@ -340,14 +387,35 @@ mod ngram_tests {
     fn proposes_tokens_after_latest_matching_suffix() {
         let history = [1, 2, 3, 4, 9, 2, 3, 4];
 
-        assert_eq!(propose_ngram_tokens(&history, 2, 2), vec![9, 2]);
+        assert_eq!(propose_ngram_tokens(&history, 2, 2).unwrap(), vec![9, 2]);
     }
 
     #[test]
     fn returns_empty_without_enough_history() {
-        assert!(propose_ngram_tokens(&[1, 2, 3], 2, 4).is_empty());
-        assert!(propose_ngram_tokens(&[1, 2, 1, 2], 0, 4).is_empty());
-        assert!(propose_ngram_tokens(&[1, 2, 1, 2], 1, 0).is_empty());
+        assert!(propose_ngram_tokens(&[1, 2, 3], 2, 4).unwrap().is_empty());
+        assert!(
+            propose_ngram_tokens(&[1, 2, 1, 2], 0, 4)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            propose_ngram_tokens(&[1, 2, 1, 2], 1, 0)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn cache_proposer_syncs_only_the_committed_prefix() {
+        let mut proposer = CachedNgramProposer::new(2, 2).unwrap();
+        let history = [1, 2, 3, 1, 2, 3, 1, 2];
+
+        assert_eq!(proposer.propose(&history, &[], 2).unwrap(), vec![3, 1]);
+        assert_eq!(
+            proposer.propose(&history, &[9], 2).unwrap(),
+            Vec::<i32>::new()
+        );
+        assert_eq!(proposer.propose(&history, &[], 2).unwrap(), vec![3, 1]);
     }
 }
 
@@ -362,7 +430,7 @@ pub(super) fn verify_inputs_for_proposals(current: i32, proposals: &[i32]) -> Ve
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum VerifySpanDecisionKind {
+pub(super) enum VerifyWindowDecisionKind {
     FullAccept,
     AcceptedStop,
     TailReject,
@@ -371,41 +439,41 @@ pub(super) enum VerifySpanDecisionKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct VerifySpanDecision {
-    pub(super) kind: VerifySpanDecisionKind,
+pub(super) struct VerifyWindowDecision {
+    pub(super) kind: VerifyWindowDecisionKind,
     pub(super) accepted_before_reject: usize,
     pub(super) repair_input_count: Option<usize>,
     pub(super) commit_count: usize,
 }
 
-impl VerifySpanDecision {
+impl VerifyWindowDecision {
     pub(super) fn rejected(self) -> bool {
         matches!(
             self.kind,
-            VerifySpanDecisionKind::TailReject
-                | VerifySpanDecisionKind::EarlyReject
-                | VerifySpanDecisionKind::EarlyRejectStop
+            VerifyWindowDecisionKind::TailReject
+                | VerifyWindowDecisionKind::EarlyReject
+                | VerifyWindowDecisionKind::EarlyRejectStop
         )
     }
 
     pub(super) fn requires_repair(self) -> bool {
-        self.kind == VerifySpanDecisionKind::EarlyReject
+        self.kind == VerifyWindowDecisionKind::EarlyReject
     }
 }
 
-pub(super) fn classify_verify_span<F>(
+pub(super) fn classify_verify_window<F>(
     draft_tokens: &[i32],
     predicted_tokens: &[i32],
     generated_len: usize,
     max_new_tokens: usize,
     mut token_is_eog: F,
-) -> OpenAiResult<VerifySpanDecision>
+) -> OpenAiResult<VerifyWindowDecision>
 where
     F: FnMut(i32) -> OpenAiResult<bool>,
 {
     if predicted_tokens.len() < draft_tokens.len() {
         return Err(OpenAiError::backend(format!(
-            "verify span returned too few tokens: got {} expected {}",
+            "verify window returned too few tokens: got {} expected {}",
             predicted_tokens.len(),
             draft_tokens.len()
         )));
@@ -421,8 +489,8 @@ where
         if accepted {
             accepted_before_reject += 1;
             if (reached_eog || reached_limit) && commit_count < draft_tokens.len() {
-                return Ok(VerifySpanDecision {
-                    kind: VerifySpanDecisionKind::AcceptedStop,
+                return Ok(VerifyWindowDecision {
+                    kind: VerifyWindowDecisionKind::AcceptedStop,
                     accepted_before_reject,
                     repair_input_count: None,
                     commit_count,
@@ -433,13 +501,13 @@ where
 
         let repair_input_count = accepted_before_reject + 1;
         let kind = if repair_input_count == draft_tokens.len() {
-            VerifySpanDecisionKind::TailReject
+            VerifyWindowDecisionKind::TailReject
         } else if reached_eog || reached_limit {
-            VerifySpanDecisionKind::EarlyRejectStop
+            VerifyWindowDecisionKind::EarlyRejectStop
         } else {
-            VerifySpanDecisionKind::EarlyReject
+            VerifyWindowDecisionKind::EarlyReject
         };
-        return Ok(VerifySpanDecision {
+        return Ok(VerifyWindowDecision {
             kind,
             accepted_before_reject,
             repair_input_count: Some(repair_input_count),
@@ -447,8 +515,8 @@ where
         });
     }
 
-    Ok(VerifySpanDecision {
-        kind: VerifySpanDecisionKind::FullAccept,
+    Ok(VerifyWindowDecision {
+        kind: VerifyWindowDecisionKind::FullAccept,
         accepted_before_reject,
         repair_input_count: None,
         commit_count,

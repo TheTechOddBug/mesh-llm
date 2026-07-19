@@ -17,9 +17,8 @@ use skippy_protocol::{
     StageConfig, StageTopology,
     binary::{
         StageReply, StageStateHeader, StageWireMessage, WireActivationDType, WireMessageKind,
-        WireReplyKind, read_stage_message, recv_ready, recv_reply, send_ready,
-        send_reply_ack_with_stats, send_reply_predicted_tokens_with_stats,
-        send_reply_predicted_with_tokens_and_stats, write_stage_message,
+        WireReplyKind, read_stage_message, recv_ready, recv_reply, send_ready, send_reply_message,
+        write_stage_message,
     },
 };
 
@@ -215,12 +214,16 @@ impl PredictionReturnReceiver {
     }
 
     pub(crate) fn try_recv_expected(&self, expected: WireReplyKind) -> Result<Option<StageReply>> {
+        self.try_recv_one_of(std::slice::from_ref(&expected))
+    }
+
+    pub(crate) fn try_recv_one_of(&self, expected: &[WireReplyKind]) -> Result<Option<StageReply>> {
         let Some(reply) = self.try_recv()? else {
             return Ok(None);
         };
-        if reply.kind != expected {
+        if !expected.contains(&reply.kind) {
             bail!(
-                "expected {expected:?} direct prediction return, got {:?}",
+                "expected one of {expected:?} from direct prediction return, got {:?}",
                 reply.kind
             );
         }
@@ -283,6 +286,13 @@ impl PredictionReturnSinks {
                 return Ok(None);
             }
             thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    pub(crate) fn remove(&self, request_id: u64, session_id: u64) {
+        let key = PredictionReturnKey::new(request_id, session_id);
+        if let Ok(mut streams) = self.streams.lock() {
+            streams.remove(&key);
         }
     }
 }
@@ -389,22 +399,7 @@ pub(crate) fn send_direct_prediction_return(
     stream: &mut TcpStream,
     reply: StageReply,
 ) -> Result<()> {
-    match reply.kind {
-        WireReplyKind::PredictedToken => send_reply_predicted_with_tokens_and_stats(
-            stream,
-            reply.predicted,
-            &reply.predicted_tokens,
-            reply.stats,
-        )
-        .context("send direct predicted-token return"),
-        WireReplyKind::PredictedTokens => {
-            send_reply_predicted_tokens_with_stats(stream, &reply.predicted_tokens, reply.stats)
-                .context("send direct predicted-tokens return")
-        }
-        WireReplyKind::Ack => {
-            send_reply_ack_with_stats(stream, reply.stats).context("send direct ACK return")
-        }
-    }
+    send_reply_message(stream, &reply).context("send direct prediction return")
 }
 
 fn driver_stage_endpoint<'a>(
@@ -487,7 +482,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_prediction_return_preserves_predicted_token_sideband() {
+    fn direct_prediction_return_preserves_typed_native_mtp_draft() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let mut client = TcpStream::connect(addr).unwrap();
@@ -496,7 +491,16 @@ mod tests {
         let reply = StageReply {
             kind: WireReplyKind::PredictedToken,
             predicted: 42,
-            predicted_tokens: vec![42, 43, 123],
+            predicted_tokens: vec![42],
+            native_mtp_draft: Some(skippy_protocol::binary::StageNativeMtpDraft {
+                token_ids: vec![43],
+                proposal_compute_us: 123,
+            }),
+            window: skippy_protocol::binary::StageReplyWindow {
+                window_id: 7,
+                accepted_len: 2,
+                correction_token: 123,
+            },
             stats: Default::default(),
         };
         send_direct_prediction_return(&mut server, reply).unwrap();
@@ -504,7 +508,17 @@ mod tests {
         let received = recv_reply(&mut client).unwrap();
         assert_eq!(received.kind, WireReplyKind::PredictedToken);
         assert_eq!(received.predicted, 42);
-        assert_eq!(received.predicted_tokens, vec![42, 43, 123]);
+        assert_eq!(received.predicted_tokens, vec![42]);
+        assert_eq!(
+            received.native_mtp_draft,
+            Some(skippy_protocol::binary::StageNativeMtpDraft {
+                token_ids: vec![43],
+                proposal_compute_us: 123,
+            })
+        );
+        assert_eq!(received.window.window_id, 7);
+        assert_eq!(received.window.accepted_len, 2);
+        assert_eq!(received.window.correction_token, 123);
     }
 
     #[test]
@@ -529,6 +543,32 @@ mod tests {
             .unwrap()
             .expect("registered prediction return sink");
         assert_eq!(stream.peer_addr().unwrap(), client.local_addr().unwrap());
+    }
+
+    #[test]
+    fn prediction_return_sinks_remove_abandoned_streams() {
+        let request_id = 41;
+        let session_id = 43;
+        let sinks = PredictionReturnSinks::default();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+
+        sinks
+            .insert_opened_sink(
+                prediction_return_open_message(request_id, session_id),
+                server,
+            )
+            .unwrap();
+        sinks.remove(request_id, session_id);
+
+        assert!(
+            sinks
+                .take_wait(request_id, session_id, Duration::from_millis(1))
+                .unwrap()
+                .is_none()
+        );
+        drop(client);
     }
 
     fn poll_test_reply(receiver: &PredictionReturnReceiver, expected: WireReplyKind) -> StageReply {

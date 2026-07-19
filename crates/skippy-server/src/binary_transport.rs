@@ -27,11 +27,11 @@ use skippy_metrics::{attr, metric};
 use skippy_protocol::{
     MessageBase, SCHEMA_VERSION, StageConfig, StageTopology,
     binary::{
-        READY_MAGIC, StageReply, StageReplyStats, StageSamplingConfig, StageStateHeader,
-        StageWireMessage, WireActivationDType, WireMessageKind, WireReplyKind,
-        activation_frame_flags_from_state_flags, read_stage_message, recv_reply, send_ready,
-        send_reply_ack, send_reply_ack_with_stats, send_reply_predicted_tokens_with_stats,
-        send_reply_predicted_with_tokens_and_stats, state_flags,
+        LLAMA_TOKEN_NULL, READY_MAGIC, StageNativeMtpDraft, StageReply, StageReplyStats,
+        StageSamplingConfig, StageStateHeader, StageWireMessage, WireActivationDType,
+        WireMessageKind, WireReplyKind, activation_frame_flags_from_state_flags,
+        read_stage_message, recv_reply, send_ready, send_reply_ack, send_reply_ack_with_stats,
+        send_reply_message, state_flags,
     },
 };
 use skippy_runtime::{
@@ -48,6 +48,7 @@ pub(crate) mod forwarding;
 mod kv_eviction;
 mod options;
 mod preconnect;
+mod restore_prefill_decode;
 mod socket;
 mod wire;
 
@@ -63,6 +64,9 @@ use self::kv_eviction::{
 };
 pub use self::options::{BinaryStageOptions, EmbeddedOpenAiStageOptions, parse_wire_dtype};
 use self::preconnect::spawn_downstream_preconnector;
+use self::restore_prefill_decode::handle_binary_restore_prefill_decode_control;
+#[cfg(test)]
+use self::restore_prefill_decode::restore_prefill_decode_as_decode_message;
 use self::socket::*;
 pub use self::wire::WireCondition;
 pub(crate) use self::wire::write_stage_message_conditioned;
@@ -278,9 +282,21 @@ fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> R
                 speculative_window: openai_options.speculative_window,
                 adaptive_speculative_window: openai_options.adaptive_speculative_window,
                 draft_n_gpu_layers: openai_options.draft_n_gpu_layers,
-                ngram_min: openai_options.ngram_min,
-                ngram_max: openai_options.ngram_max,
-                native_mtp_enabled,
+                speculative: openai_options.speculative.clone(),
+                ngram_min: openai_options
+                    .speculative
+                    .ngram
+                    .as_ref()
+                    .filter(|ngram| ngram.kind == frontend::NgramProposerKind::Simple)
+                    .map_or(0, |ngram| ngram.min_ngram),
+                ngram_max: openai_options
+                    .speculative
+                    .ngram
+                    .as_ref()
+                    .filter(|ngram| ngram.kind == frontend::NgramProposerKind::Simple)
+                    .map_or(0, |ngram| ngram.max_proposal_tokens.min(ngram.max_ngram)),
+                native_mtp_enabled: native_mtp_enabled
+                    && openai_options.speculative.native_mtp.enabled,
                 native_mtp_draft_model_path: None,
                 native_mtp_max_tokens: openai_options.native_mtp_max_tokens,
                 native_mtp_min_tokens: openai_options.native_mtp_min_tokens,
@@ -717,6 +733,8 @@ fn handle_binary_connection(
                 reset_start_unix_nanos,
                 reset_end_unix_nanos,
             );
+            prediction_return_streams.remove(&(message.request_id, message.session_id));
+            prediction_return_sinks.remove(message.request_id, message.session_id);
             send_reply_ack_with_stats(&mut *upstream, stop_stats).context("send stop ACK")?;
             continue;
         }
@@ -884,6 +902,7 @@ fn handle_binary_connection(
                     activation_width,
                     control_started,
                     control_stats,
+                    prediction_return_sinks,
                     &mut prediction_return_streams,
                     downstream_connect_timeout_secs,
                     native_mtp_enabled,
@@ -1043,7 +1062,7 @@ fn handle_binary_connection(
         let mut decode_batch_wait_ms = 0.0;
         let input_activation_bytes = message.activation.len();
         let mut proactive_eviction = None;
-        let (predicted_token, predicted_tokens, output, compute_ms) = if restored_prefill {
+        let (predicted_token, mut predicted_tokens, output, compute_ms) = if restored_prefill {
             let now = now_unix_nanos() as u64;
             compute_start_unix_nanos = now;
             compute_end_unix_nanos = now;
@@ -1064,7 +1083,7 @@ fn handle_binary_connection(
             } else {
                 elapsed_ms(input_decode_started)
             };
-            if message.kind == WireMessageKind::VerifySpan
+            if message.kind == WireMessageKind::VerifyWindow
                 && (message.state.flags & state_flags::SKIP_VERIFY_CHECKPOINT) == 0
             {
                 let checkpoint_started = Instant::now();
@@ -1072,7 +1091,7 @@ fn handle_binary_connection(
                     let mut runtime = runtime.lock().expect("runtime lock poisoned");
                     runtime
                         .checkpoint_session(&session_key)
-                        .context("checkpoint binary stage session before verify span")?;
+                        .context("checkpoint binary stage session before verify window")?;
                 }
                 let checkpoint_us = elapsed_us(checkpoint_started);
                 record_session_control_timing(
@@ -1511,19 +1530,20 @@ fn handle_binary_connection(
             );
             message_reply_stats.merge(pending_reply_stats);
             pending_reply_stats = StageReplyStats::default();
-            record_verify_span_timing(
+            record_verify_window_timing(
                 &mut message_reply_stats,
                 &message,
                 compute_ms,
                 forward_write_ms,
                 downstream_wait_ms,
             );
-            let reply_kind = if message.kind == WireMessageKind::VerifySpan {
+            let reply_kind = if message.kind == WireMessageKind::VerifyWindow {
                 WireReplyKind::PredictedTokens
             } else {
                 WireReplyKind::PredictedToken
             };
-            let predicted_token_count = if message.kind == WireMessageKind::VerifySpan {
+            let native_mtp_draft = split_native_mtp_reply(&message, &mut predicted_tokens)?;
+            let predicted_token_count = if message.kind == WireMessageKind::VerifyWindow {
                 predicted_tokens.len()
             } else {
                 predicted_tokens.len().max(1)
@@ -1531,10 +1551,13 @@ fn handle_binary_connection(
             let reply_start_unix_nanos = now_unix_nanos() as u64;
             upstream_reply_start_unix_nanos.get_or_insert(reply_start_unix_nanos);
             let reply_started = Instant::now();
+            let reply_window = reply_window_for_message(&message, &predicted_tokens);
             let reply = StageReply {
                 kind: reply_kind,
                 predicted: predicted_token,
                 predicted_tokens,
+                native_mtp_draft,
+                window: reply_window,
                 stats: message_reply_stats,
             };
             if let Some(return_stream) =
@@ -1605,24 +1628,24 @@ fn handle_binary_connection(
 
         let message_end_unix_nanos = now_unix_nanos() as u64;
         let message_elapsed_ms = elapsed_ms(message_started);
-        let verify_span_pre_compute_ms = if message.kind == WireMessageKind::VerifySpan {
+        let verify_window_pre_compute_ms = if message.kind == WireMessageKind::VerifyWindow {
             nanos_delta_ms(message_start_unix_nanos, compute_start_unix_nanos)
         } else {
             0.0
         };
-        let verify_span_post_compute_ms = if message.kind == WireMessageKind::VerifySpan {
+        let verify_window_post_compute_ms = if message.kind == WireMessageKind::VerifyWindow {
             nanos_delta_ms(compute_end_unix_nanos, message_end_unix_nanos)
         } else {
             0.0
         };
-        let verify_span_pre_reply_ms = if message.kind == WireMessageKind::VerifySpan {
+        let verify_window_pre_reply_ms = if message.kind == WireMessageKind::VerifyWindow {
             upstream_reply_start_unix_nanos
                 .map(|reply_start| nanos_delta_ms(compute_end_unix_nanos, reply_start))
                 .unwrap_or(0.0)
         } else {
             0.0
         };
-        let verify_span_after_reply_ms = if message.kind == WireMessageKind::VerifySpan {
+        let verify_window_after_reply_ms = if message.kind == WireMessageKind::VerifyWindow {
             upstream_reply_end_unix_nanos
                 .map(|reply_end| nanos_delta_ms(reply_end, message_end_unix_nanos))
                 .unwrap_or(0.0)
@@ -1651,10 +1674,10 @@ fn handle_binary_connection(
             session_auto_align_count,
             session_auto_align_ms,
             session_auto_align_trimmed_tokens,
-            verify_span_pre_compute_ms,
-            verify_span_post_compute_ms,
-            verify_span_pre_reply_ms,
-            verify_span_after_reply_ms,
+            verify_window_pre_compute_ms,
+            verify_window_post_compute_ms,
+            verify_window_pre_reply_ms,
+            verify_window_after_reply_ms,
             upstream_message_wait_ms: recv_read_ms,
         });
 
@@ -1829,6 +1852,51 @@ fn native_mtp_prediction_tokens(predicted: i32, draft: Option<NativeMtpDraft>) -
     tokens
 }
 
+/// Converts the temporary llama-stage sideband into the typed stage reply field.
+///
+/// The C ABI still returns the proposal as a trailer. The network boundary is
+/// authoritative: consumers receive only target predictions plus a separate
+/// native-MTP draft. A malformed trailer is rejected instead of being exposed
+/// as target-model output.
+fn split_native_mtp_reply(
+    message: &StageWireMessage,
+    prediction_tokens: &mut Vec<i32>,
+) -> Result<Option<StageNativeMtpDraft>> {
+    let sideband_offset = match message.kind {
+        WireMessageKind::DecodeEmbd
+        | WireMessageKind::DecodeReadout
+        | WireMessageKind::DecodeLightCtx
+        | WireMessageKind::DecodeReplayEmbd
+        | WireMessageKind::DecodeReplayFinalEmbd => 1,
+        WireMessageKind::VerifyWindow => message.tokens.len(),
+        _ => return Ok(None),
+    };
+    if prediction_tokens.len() <= sideband_offset {
+        return Ok(None);
+    }
+    let draft_token_count = usize::try_from(prediction_tokens[sideband_offset])
+        .map_err(|_| anyhow!("negative native MTP draft token count"))?;
+    let draft_start = sideband_offset + 1;
+    let draft_end = draft_start
+        .checked_add(draft_token_count)
+        .ok_or_else(|| anyhow!("native MTP draft token count overflow"))?;
+    let compute_index = draft_end;
+    if prediction_tokens.len() != compute_index + 1 {
+        bail!(
+            "malformed native MTP sideband: expected {} values, got {}",
+            compute_index + 1,
+            prediction_tokens.len()
+        );
+    }
+    let proposal_compute_us = i64::from(prediction_tokens[compute_index].max(0));
+    let token_ids = prediction_tokens[draft_start..draft_end].to_vec();
+    prediction_tokens.truncate(sideband_offset);
+    Ok((!token_ids.is_empty()).then_some(StageNativeMtpDraft {
+        token_ids,
+        proposal_compute_us,
+    }))
+}
+
 fn binary_auto_align_session_enabled() -> bool {
     truthy_env(env::var(AUTO_ALIGN_SESSION_ENV).ok().as_deref())
 }
@@ -1850,20 +1918,12 @@ fn message_allows_session_auto_align(message: &StageWireMessage) -> bool {
         WireMessageKind::DecodeEmbd
             | WireMessageKind::DecodeReadout
             | WireMessageKind::DecodeLightCtx
-            | WireMessageKind::VerifySpan
+            | WireMessageKind::VerifyWindow
     )
 }
 
 fn message_pos_start_as_token_count(message: &StageWireMessage) -> Option<u64> {
     u64::try_from(message.pos_start).ok()
-}
-
-#[cfg(test)]
-fn native_mtp_enabled_from(value: Option<&str>) -> bool {
-    !matches!(
-        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
-        Some("0" | "false" | "off" | "disable" | "disabled" | "no")
-    )
 }
 
 pub(crate) fn stage_output_activation_capacity(
@@ -2082,32 +2142,32 @@ fn record_prefill_edge_transport(
     );
 }
 
-fn record_verify_span_timing(
+fn record_verify_window_timing(
     stats: &mut StageReplyStats,
     message: &StageWireMessage,
     compute_ms: f64,
     forward_write_ms: f64,
     downstream_wait_ms: f64,
 ) {
-    if message.kind != WireMessageKind::VerifySpan {
+    if message.kind != WireMessageKind::VerifyWindow {
         return;
     }
     let compute_us = ms_to_us(compute_ms);
     let forward_write_us = ms_to_us(forward_write_ms);
     let downstream_wait_us = ms_to_us(downstream_wait_ms);
     let token_count = i64::from(message.token_count.max(0));
-    stats.verify_span_compute_us += compute_us;
-    stats.verify_span_forward_write_us += forward_write_us;
-    stats.verify_span_downstream_wait_us += downstream_wait_us;
-    stats.verify_span_total_us += compute_us + forward_write_us + downstream_wait_us;
-    stats.verify_span_stage_count += 1;
-    stats.verify_span_request_count += 1;
-    stats.verify_span_token_count += token_count;
-    stats.verify_span_max_tokens = stats.verify_span_max_tokens.max(token_count);
+    stats.verify_window_compute_us += compute_us;
+    stats.verify_window_forward_write_us += forward_write_us;
+    stats.verify_window_downstream_wait_us += downstream_wait_us;
+    stats.verify_window_total_us += compute_us + forward_write_us + downstream_wait_us;
+    stats.verify_window_stage_count += 1;
+    stats.verify_window_request_count += 1;
+    stats.verify_window_token_count += token_count;
+    stats.verify_window_max_tokens = stats.verify_window_max_tokens.max(token_count);
     if (message.state.flags & state_flags::SKIP_VERIFY_CHECKPOINT) == 0 {
-        stats.verify_span_checkpointed_requests += 1;
+        stats.verify_window_checkpointed_requests += 1;
     } else {
-        stats.verify_span_skip_checkpoint_requests += 1;
+        stats.verify_window_skip_checkpoint_requests += 1;
     }
 }
 
@@ -2398,6 +2458,9 @@ fn configure_prediction_return_stream(
     prediction_return_sinks: &PredictionReturnSinks,
     prediction_return_streams: &mut BTreeMap<(u64, u64), TcpStream>,
 ) {
+    if prediction_return_streams.contains_key(&(request_id, session_id)) {
+        return;
+    }
     match prediction_return_sinks.take_wait(request_id, session_id, Duration::from_millis(250)) {
         Ok(Some(stream)) => {
             prediction_return_streams.insert((request_id, session_id), stream);
@@ -2429,257 +2492,32 @@ fn configure_prediction_return_stream(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn handle_binary_restore_prefill_decode_control(
-    config: &StageConfig,
-    topology: Option<&StageTopology>,
-    runtime: &Arc<Mutex<RuntimeState>>,
-    kv: Option<&Arc<KvStageIntegration>>,
-    telemetry: &Telemetry,
-    session_id: &str,
-    wire_session_id: u64,
-    mut message: StageWireMessage,
-    downstream: Option<&mut TcpStream>,
-    wire_dtype: WireActivationDType,
-    downstream_wire_condition: WireCondition,
-    activation_width: i32,
-    control_started: Instant,
-    mut control_stats: StageReplyStats,
-    prediction_return_streams: &mut BTreeMap<(u64, u64), TcpStream>,
-    downstream_connect_timeout_secs: u64,
-    native_mtp_enabled: bool,
-) -> Result<()> {
-    let (prefix_tokens, current_token) = restore_decode_sideband(&message)?;
-    let local = maybe_prefix_cache_control(
-        config,
-        runtime,
-        kv,
-        telemetry,
-        session_id,
-        &message,
-        prefix_tokens,
-    );
-    control_stats.merge(local.stats);
-    if !local.hit {
-        let mut attrs = binary_message_attrs(config, wire_session_id, &message);
-        attrs.insert("skippy.kv.control_hit".to_string(), json!(false));
-        attrs.insert(
-            "llama_stage.elapsed_ms".to_string(),
-            json!(elapsed_ms(control_started)),
-        );
-        telemetry.emit_debug("stage.binary_prefix_cache_decode_control", attrs);
-        send_one_off_direct_return(
-            config,
-            topology,
-            &message,
-            wire_dtype,
-            downstream_connect_timeout_secs,
-            StageReply {
-                kind: WireReplyKind::Ack,
-                predicted: 0,
-                predicted_tokens: Vec::new(),
-                stats: control_stats,
-            },
-        )
-        .context("send restore-decode miss direct ACK")?;
-        return Ok(());
-    }
-
-    let input = input_activation_frame(config, topology, &mut message, activation_width)?;
-    let decode_message = restore_prefill_decode_as_decode_message(&message, current_token);
-    let compute_started = Instant::now();
-    let (predicted_token, output, runtime_lock_wait_ms, runtime_lock_hold_ms, proactive_eviction) = {
-        let lock_started = Instant::now();
-        let mut runtime = runtime.lock().expect("runtime lock poisoned");
-        let runtime_lock_wait_ms = elapsed_ms(lock_started);
-        let lock_hold_started = Instant::now();
-        if let Some(metadata) = message.chat_sampling_metadata.as_deref() {
-            let sampling = runtime_sampling_config(message.sampling.as_ref());
-            runtime
-                .configure_chat_sampling(
-                    session_id,
-                    metadata,
-                    message.state.prompt_token_count.max(0) as u64,
-                    sampling.as_ref(),
-                )
-                .context("configure restore-decode chat sampling")?;
-        }
-        let proactive_eviction = evict_binary_resident_prefix_for_decode(
-            &mut runtime,
-            kv,
-            session_id,
-            BinaryProactiveEvictionPlan {
-                required: true,
-                ensure_session_before_eviction: false,
-            },
-        )?;
-        let (predicted, _, output) = run_binary_stage_message(
-            &mut runtime,
-            session_id,
-            &decode_message,
-            &[current_token],
-            input.as_ref(),
-            BinaryStageExecutionOptions::new(
-                downstream.is_none(),
-                stage_output_activation_capacity(
-                    config,
-                    decode_message.token_count,
-                    activation_width,
-                )?,
-                native_mtp_enabled,
-            ),
-        )
-        .context("execute restore-decode stage message")?;
-        (
-            predicted,
-            output,
-            runtime_lock_wait_ms,
-            elapsed_ms(lock_hold_started),
-            proactive_eviction,
-        )
-    };
-    let compute_ms = elapsed_ms(compute_started);
-    emit_binary_proactive_eviction(telemetry, &proactive_eviction);
-
-    if let Some(downstream) = downstream {
-        let forwarded =
-            forwarded_stage_message_timed(config, &message, &output, wire_dtype, activation_width)
-                .context("forward restore-decode activation")?;
-        write_stage_message_conditioned(
-            &mut *downstream,
-            &forwarded.message,
-            wire_dtype,
-            downstream_wire_condition,
-        )
-        .context("forward restore-decode downstream")?;
-        let mut attrs = binary_message_attrs(config, wire_session_id, &message);
-        attrs.insert("skippy.kv.control_hit".to_string(), json!(true));
-        attrs.insert(
-            "llama_stage.elapsed_ms".to_string(),
-            json!(elapsed_ms(control_started)),
-        );
-        attrs.insert("llama_stage.compute_ms".to_string(), json!(compute_ms));
-        attrs.insert(
-            "llama_stage.runtime_lock_wait_ms".to_string(),
-            json!(runtime_lock_wait_ms),
-        );
-        attrs.insert(
-            "llama_stage.runtime_lock_hold_ms".to_string(),
-            json!(runtime_lock_hold_ms),
-        );
-        proactive_eviction.insert_attrs(&mut attrs);
-        attrs.insert(
-            "llama_stage.forward_activation_bytes".to_string(),
-            json!(forwarded.message.activation.len()),
-        );
-        attrs.insert(
-            "llama_stage.activation_encode_ms".to_string(),
-            json!(forwarded.activation_encode_ms),
-        );
-        telemetry.emit_debug("stage.binary_prefix_cache_decode_control", attrs);
-        let downstream_reply =
-            recv_reply(&mut *downstream).context("restore-decode downstream reply")?;
-        if downstream_reply.kind != WireReplyKind::PredictedToken {
-            bail!(
-                "restore-decode expected downstream PredictedToken, got {:?}",
-                downstream_reply.kind
-            );
-        }
-        control_stats.merge(downstream_reply.stats);
-        send_one_off_direct_return(
-            config,
-            topology,
-            &message,
-            wire_dtype,
-            downstream_connect_timeout_secs,
-            StageReply {
-                stats: control_stats,
-                ..downstream_reply
-            },
-        )
-        .context("relay restore-decode direct predicted reply")?;
-        return Ok(());
-    }
-
-    {
-        let mut runtime = runtime.lock().expect("runtime lock poisoned");
-        let record = maybe_record_binary_full_prefill(
-            config,
-            &mut runtime,
-            kv,
-            telemetry,
-            session_id,
-            &message,
-            message.tokens.as_slice(),
-        );
-        add_binary_record_stats(&mut control_stats, config, &record);
-    }
-    let mut attrs = binary_message_attrs(config, wire_session_id, &message);
-    attrs.insert("skippy.kv.control_hit".to_string(), json!(true));
-    attrs.insert(
-        "llama_stage.elapsed_ms".to_string(),
-        json!(elapsed_ms(control_started)),
-    );
-    attrs.insert("llama_stage.compute_ms".to_string(), json!(compute_ms));
-    attrs.insert(
-        "llama_stage.runtime_lock_wait_ms".to_string(),
-        json!(runtime_lock_wait_ms),
-    );
-    attrs.insert(
-        "llama_stage.runtime_lock_hold_ms".to_string(),
-        json!(runtime_lock_hold_ms),
-    );
-    proactive_eviction.insert_attrs(&mut attrs);
-    telemetry.emit_debug("stage.binary_prefix_cache_decode_control", attrs);
-    let return_stream = prediction_return_streams
-        .get_mut(&(message.request_id, message.session_id))
-        .ok_or_else(|| anyhow!("missing direct prediction return stream"))?;
-    direct_return::send_direct_prediction_return(
-        return_stream,
-        StageReply {
-            kind: WireReplyKind::PredictedToken,
-            predicted: predicted_token,
-            predicted_tokens: vec![predicted_token],
-            stats: control_stats,
-        },
-    )
-    .context("send restore-decode direct predicted reply")?;
-    Ok(())
-}
-
-fn send_one_off_direct_return(
-    config: &StageConfig,
-    topology: Option<&StageTopology>,
-    message: &StageWireMessage,
-    wire_dtype: WireActivationDType,
-    downstream_connect_timeout_secs: u64,
-    reply: StageReply,
-) -> Result<()> {
-    let mut stream = direct_return::open_prediction_return_stream(
-        config,
-        topology,
-        message.request_id,
-        message.session_id,
-        wire_dtype,
-        downstream_connect_timeout_secs,
-    )?;
-    direct_return::send_direct_prediction_return(&mut stream, reply)
-}
-
 fn send_stage_reply(stream: &mut TcpStream, reply: StageReply) -> Result<()> {
-    match reply.kind {
-        WireReplyKind::PredictedToken => send_reply_predicted_with_tokens_and_stats(
-            stream,
-            reply.predicted,
-            &reply.predicted_tokens,
-            reply.stats,
-        )
-        .context("send predicted-token reply"),
-        WireReplyKind::PredictedTokens => {
-            send_reply_predicted_tokens_with_stats(stream, &reply.predicted_tokens, reply.stats)
-                .context("send predicted-tokens reply")
+    send_reply_message(stream, &reply).context("send stage reply")
+}
+
+fn reply_window_for_message(
+    message: &StageWireMessage,
+    predicted_tokens: &[i32],
+) -> skippy_protocol::binary::StageReplyWindow {
+    if message.kind == WireMessageKind::VerifyWindow {
+        let accepted_len = message
+            .tokens
+            .iter()
+            .skip(1)
+            .zip(predicted_tokens)
+            .take_while(|(input, predicted)| input == predicted)
+            .count();
+        skippy_protocol::binary::StageReplyWindow {
+            window_id: message.state.seq_id,
+            accepted_len: i32::try_from(accepted_len).unwrap_or(i32::MAX),
+            correction_token: predicted_tokens
+                .get(accepted_len)
+                .copied()
+                .unwrap_or(LLAMA_TOKEN_NULL),
         }
-        WireReplyKind::Ack => send_reply_ack_with_stats(stream, reply.stats).context("send ACK"),
+    } else {
+        Default::default()
     }
 }
 
@@ -2689,36 +2527,6 @@ fn emit_binary_proactive_eviction(telemetry: &Telemetry, eviction: &BinaryProact
     } else {
         telemetry.emit_debug("stage.binary_kv_record_decision", eviction.attrs());
     }
-}
-
-fn restore_decode_sideband(message: &StageWireMessage) -> Result<(&[i32], i32)> {
-    let Some((&current, prefix_tokens)) = message.tokens.split_last() else {
-        bail!("restore-decode message requires prefix tokens plus current token");
-    };
-    if prefix_tokens.is_empty() {
-        bail!("restore-decode message requires non-empty prefix tokens");
-    }
-    Ok((prefix_tokens, current))
-}
-
-fn restore_prefill_decode_as_decode_message(
-    message: &StageWireMessage,
-    current_token: i32,
-) -> StageWireMessage {
-    let mut decode = message.clone();
-    decode.kind = WireMessageKind::DecodeEmbd;
-    decode.token_count = 1;
-    decode.tokens = vec![current_token];
-    decode.positions.clear();
-    decode.activation.clear();
-    decode.raw_bytes.clear();
-    decode.state.phase = StageStateHeader::new(
-        WireMessageKind::DecodeEmbd,
-        message.state.dtype().unwrap_or(WireActivationDType::F32),
-    )
-    .phase;
-    decode.state.current_token = current_token;
-    decode
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3319,21 +3127,21 @@ struct BinaryRequestSummary {
     session_auto_align_count: usize,
     session_auto_align_ms: f64,
     session_auto_align_trimmed_tokens: u64,
-    verify_span_count: usize,
-    verify_span_session_auto_align_count: usize,
-    verify_span_session_auto_align_ms: f64,
-    verify_span_session_auto_align_trimmed_tokens: u64,
-    verify_span_token_count: u64,
-    verify_span_max_tokens: u64,
-    verify_span_compute_ms: f64,
-    verify_span_input_activation_decode_ms: f64,
-    verify_span_runtime_lock_hold_ms: f64,
-    verify_span_upstream_reply_ms: f64,
-    verify_span_pre_compute_ms: f64,
-    verify_span_post_compute_ms: f64,
-    verify_span_pre_reply_ms: f64,
-    verify_span_after_reply_ms: f64,
-    verify_span_upstream_message_wait_ms: f64,
+    verify_window_count: usize,
+    verify_window_session_auto_align_count: usize,
+    verify_window_session_auto_align_ms: f64,
+    verify_window_session_auto_align_trimmed_tokens: u64,
+    verify_window_token_count: u64,
+    verify_window_max_tokens: u64,
+    verify_window_compute_ms: f64,
+    verify_window_input_activation_decode_ms: f64,
+    verify_window_runtime_lock_hold_ms: f64,
+    verify_window_upstream_reply_ms: f64,
+    verify_window_pre_compute_ms: f64,
+    verify_window_post_compute_ms: f64,
+    verify_window_pre_reply_ms: f64,
+    verify_window_after_reply_ms: f64,
+    verify_window_upstream_message_wait_ms: f64,
     reply_stats: StageReplyStats,
 }
 
@@ -3359,10 +3167,10 @@ struct BinaryMessageObservation<'a> {
     session_auto_align_count: usize,
     session_auto_align_ms: f64,
     session_auto_align_trimmed_tokens: u64,
-    verify_span_pre_compute_ms: f64,
-    verify_span_post_compute_ms: f64,
-    verify_span_pre_reply_ms: f64,
-    verify_span_after_reply_ms: f64,
+    verify_window_pre_compute_ms: f64,
+    verify_window_post_compute_ms: f64,
+    verify_window_pre_reply_ms: f64,
+    verify_window_after_reply_ms: f64,
     upstream_message_wait_ms: f64,
 }
 
@@ -3517,25 +3325,26 @@ impl BinaryRequestSummary {
         self.session_auto_align_trimmed_tokens = self
             .session_auto_align_trimmed_tokens
             .saturating_add(observation.session_auto_align_trimmed_tokens);
-        if message.kind == WireMessageKind::VerifySpan {
+        if message.kind == WireMessageKind::VerifyWindow {
             let token_count = message.token_count.max(0) as u64;
-            self.verify_span_count += 1;
-            self.verify_span_token_count = self.verify_span_token_count.saturating_add(token_count);
-            self.verify_span_max_tokens = self.verify_span_max_tokens.max(token_count);
-            self.verify_span_session_auto_align_count += observation.session_auto_align_count;
-            self.verify_span_session_auto_align_ms += observation.session_auto_align_ms;
-            self.verify_span_session_auto_align_trimmed_tokens = self
-                .verify_span_session_auto_align_trimmed_tokens
+            self.verify_window_count += 1;
+            self.verify_window_token_count =
+                self.verify_window_token_count.saturating_add(token_count);
+            self.verify_window_max_tokens = self.verify_window_max_tokens.max(token_count);
+            self.verify_window_session_auto_align_count += observation.session_auto_align_count;
+            self.verify_window_session_auto_align_ms += observation.session_auto_align_ms;
+            self.verify_window_session_auto_align_trimmed_tokens = self
+                .verify_window_session_auto_align_trimmed_tokens
                 .saturating_add(observation.session_auto_align_trimmed_tokens);
-            self.verify_span_compute_ms += observation.compute_ms;
-            self.verify_span_input_activation_decode_ms += observation.input_activation_decode_ms;
-            self.verify_span_runtime_lock_hold_ms += observation.runtime_lock_hold_ms;
-            self.verify_span_upstream_reply_ms += observation.upstream_reply_ms;
-            self.verify_span_pre_compute_ms += observation.verify_span_pre_compute_ms;
-            self.verify_span_post_compute_ms += observation.verify_span_post_compute_ms;
-            self.verify_span_pre_reply_ms += observation.verify_span_pre_reply_ms;
-            self.verify_span_after_reply_ms += observation.verify_span_after_reply_ms;
-            self.verify_span_upstream_message_wait_ms += observation.upstream_message_wait_ms;
+            self.verify_window_compute_ms += observation.compute_ms;
+            self.verify_window_input_activation_decode_ms += observation.input_activation_decode_ms;
+            self.verify_window_runtime_lock_hold_ms += observation.runtime_lock_hold_ms;
+            self.verify_window_upstream_reply_ms += observation.upstream_reply_ms;
+            self.verify_window_pre_compute_ms += observation.verify_window_pre_compute_ms;
+            self.verify_window_post_compute_ms += observation.verify_window_post_compute_ms;
+            self.verify_window_pre_reply_ms += observation.verify_window_pre_reply_ms;
+            self.verify_window_after_reply_ms += observation.verify_window_after_reply_ms;
+            self.verify_window_upstream_message_wait_ms += observation.upstream_message_wait_ms;
         }
         self.reply_stats.merge(observation.reply_stats);
     }
@@ -3662,115 +3471,115 @@ impl BinaryRequestSummary {
             );
         }
         attrs.insert(
-            "skippy.verify_span_count".to_string(),
-            json!(self.verify_span_count),
+            "skippy.verify_window_count".to_string(),
+            json!(self.verify_window_count),
         );
         attrs.insert(
-            "skippy.verify_span_token_count".to_string(),
-            json!(self.verify_span_token_count),
+            "skippy.verify_window_token_count".to_string(),
+            json!(self.verify_window_token_count),
         );
         attrs.insert(
-            "skippy.verify_span_max_tokens".to_string(),
-            json!(self.verify_span_max_tokens),
+            "skippy.verify_window_max_tokens".to_string(),
+            json!(self.verify_window_max_tokens),
         );
         attrs.insert(
-            "skippy.verify_span_session_auto_align_count".to_string(),
-            json!(self.verify_span_session_auto_align_count),
+            "skippy.verify_window_session_auto_align_count".to_string(),
+            json!(self.verify_window_session_auto_align_count),
         );
         attrs.insert(
-            "skippy.verify_span_session_auto_align_ms".to_string(),
-            json!(self.verify_span_session_auto_align_ms),
+            "skippy.verify_window_session_auto_align_ms".to_string(),
+            json!(self.verify_window_session_auto_align_ms),
         );
         attrs.insert(
-            "skippy.verify_span_session_auto_align_trimmed_tokens".to_string(),
-            json!(self.verify_span_session_auto_align_trimmed_tokens),
+            "skippy.verify_window_session_auto_align_trimmed_tokens".to_string(),
+            json!(self.verify_window_session_auto_align_trimmed_tokens),
         );
-        if self.verify_span_session_auto_align_count > 0 {
+        if self.verify_window_session_auto_align_count > 0 {
             attrs.insert(
-                "skippy.verify_span_session_auto_align_ms_avg".to_string(),
+                "skippy.verify_window_session_auto_align_ms_avg".to_string(),
                 json!(
-                    self.verify_span_session_auto_align_ms
-                        / self.verify_span_session_auto_align_count as f64
+                    self.verify_window_session_auto_align_ms
+                        / self.verify_window_session_auto_align_count as f64
                 ),
             );
         }
         attrs.insert(
-            "skippy.verify_span_pre_compute_ms".to_string(),
-            json!(self.verify_span_pre_compute_ms),
+            "skippy.verify_window_pre_compute_ms".to_string(),
+            json!(self.verify_window_pre_compute_ms),
         );
         attrs.insert(
-            "skippy.verify_span_compute_ms".to_string(),
-            json!(self.verify_span_compute_ms),
+            "skippy.verify_window_compute_ms".to_string(),
+            json!(self.verify_window_compute_ms),
         );
         attrs.insert(
-            "skippy.verify_span_input_activation_decode_ms".to_string(),
-            json!(self.verify_span_input_activation_decode_ms),
+            "skippy.verify_window_input_activation_decode_ms".to_string(),
+            json!(self.verify_window_input_activation_decode_ms),
         );
         attrs.insert(
-            "skippy.verify_span_runtime_lock_hold_ms".to_string(),
-            json!(self.verify_span_runtime_lock_hold_ms),
+            "skippy.verify_window_runtime_lock_hold_ms".to_string(),
+            json!(self.verify_window_runtime_lock_hold_ms),
         );
         attrs.insert(
-            "skippy.verify_span_upstream_reply_ms".to_string(),
-            json!(self.verify_span_upstream_reply_ms),
+            "skippy.verify_window_upstream_reply_ms".to_string(),
+            json!(self.verify_window_upstream_reply_ms),
         );
         attrs.insert(
-            "skippy.verify_span_post_compute_ms".to_string(),
-            json!(self.verify_span_post_compute_ms),
+            "skippy.verify_window_post_compute_ms".to_string(),
+            json!(self.verify_window_post_compute_ms),
         );
         attrs.insert(
-            "skippy.verify_span_pre_reply_ms".to_string(),
-            json!(self.verify_span_pre_reply_ms),
+            "skippy.verify_window_pre_reply_ms".to_string(),
+            json!(self.verify_window_pre_reply_ms),
         );
         attrs.insert(
-            "skippy.verify_span_after_reply_ms".to_string(),
-            json!(self.verify_span_after_reply_ms),
+            "skippy.verify_window_after_reply_ms".to_string(),
+            json!(self.verify_window_after_reply_ms),
         );
         attrs.insert(
-            "skippy.verify_span_upstream_message_wait_ms".to_string(),
-            json!(self.verify_span_upstream_message_wait_ms),
+            "skippy.verify_window_upstream_message_wait_ms".to_string(),
+            json!(self.verify_window_upstream_message_wait_ms),
         );
-        if self.verify_span_count > 0 {
-            let verify_span_count = self.verify_span_count as f64;
+        if self.verify_window_count > 0 {
+            let verify_window_count = self.verify_window_count as f64;
             attrs.insert(
-                "skippy.verify_span_pre_compute_ms_avg".to_string(),
-                json!(self.verify_span_pre_compute_ms / verify_span_count),
+                "skippy.verify_window_pre_compute_ms_avg".to_string(),
+                json!(self.verify_window_pre_compute_ms / verify_window_count),
             );
             attrs.insert(
-                "skippy.verify_span_compute_ms_avg".to_string(),
-                json!(self.verify_span_compute_ms / verify_span_count),
+                "skippy.verify_window_compute_ms_avg".to_string(),
+                json!(self.verify_window_compute_ms / verify_window_count),
             );
             attrs.insert(
-                "skippy.verify_span_input_activation_decode_ms_avg".to_string(),
-                json!(self.verify_span_input_activation_decode_ms / verify_span_count),
+                "skippy.verify_window_input_activation_decode_ms_avg".to_string(),
+                json!(self.verify_window_input_activation_decode_ms / verify_window_count),
             );
             attrs.insert(
-                "skippy.verify_span_runtime_lock_hold_ms_avg".to_string(),
-                json!(self.verify_span_runtime_lock_hold_ms / verify_span_count),
+                "skippy.verify_window_runtime_lock_hold_ms_avg".to_string(),
+                json!(self.verify_window_runtime_lock_hold_ms / verify_window_count),
             );
             attrs.insert(
-                "skippy.verify_span_upstream_reply_ms_avg".to_string(),
-                json!(self.verify_span_upstream_reply_ms / verify_span_count),
+                "skippy.verify_window_upstream_reply_ms_avg".to_string(),
+                json!(self.verify_window_upstream_reply_ms / verify_window_count),
             );
             attrs.insert(
-                "skippy.verify_span_tokens_avg".to_string(),
-                json!(self.verify_span_token_count as f64 / verify_span_count),
+                "skippy.verify_window_tokens_avg".to_string(),
+                json!(self.verify_window_token_count as f64 / verify_window_count),
             );
             attrs.insert(
-                "skippy.verify_span_post_compute_ms_avg".to_string(),
-                json!(self.verify_span_post_compute_ms / verify_span_count),
+                "skippy.verify_window_post_compute_ms_avg".to_string(),
+                json!(self.verify_window_post_compute_ms / verify_window_count),
             );
             attrs.insert(
-                "skippy.verify_span_pre_reply_ms_avg".to_string(),
-                json!(self.verify_span_pre_reply_ms / verify_span_count),
+                "skippy.verify_window_pre_reply_ms_avg".to_string(),
+                json!(self.verify_window_pre_reply_ms / verify_window_count),
             );
             attrs.insert(
-                "skippy.verify_span_after_reply_ms_avg".to_string(),
-                json!(self.verify_span_after_reply_ms / verify_span_count),
+                "skippy.verify_window_after_reply_ms_avg".to_string(),
+                json!(self.verify_window_after_reply_ms / verify_window_count),
             );
             attrs.insert(
-                "skippy.verify_span_upstream_message_wait_ms_avg".to_string(),
-                json!(self.verify_span_upstream_message_wait_ms / verify_span_count),
+                "skippy.verify_window_upstream_message_wait_ms_avg".to_string(),
+                json!(self.verify_window_upstream_message_wait_ms / verify_window_count),
             );
         }
         let lookups = self.reply_stats.kv_lookup_hits + self.reply_stats.kv_lookup_misses;
@@ -3958,7 +3767,7 @@ pub(crate) fn run_binary_stage_message(
                 output,
             ))
         }
-        WireMessageKind::VerifySpan => {
+        WireMessageKind::VerifyWindow => {
             let sampling = runtime_sampling_config(message.sampling.as_ref());
             let (predicted_tokens, output) = runtime.verify_frame_sampled(
                 session_id,

@@ -3488,20 +3488,9 @@ async fn prepare_runtime_startup(
         .iter()
         .map(|model| model.resolved_path.clone())
         .collect();
-    let update_check_paths = resolved_models.clone();
-    match tokio::task::spawn_blocking(move || {
-        models::warn_about_updates_for_paths(&update_check_paths);
-    })
-    .await
-    {
-        Ok(()) => {}
-        Err(err) => {
-            let _ = emit_event(OutputEvent::Warning {
-                message: format!("Could not join Hugging Face update check task: {err}"),
-                context: None,
-            });
-        }
-    }
+    spawn_advisory_startup_task(move || {
+        models::warn_about_updates_for_paths(&resolved_models);
+    });
 
     let requested_model_names = startup_models
         .iter()
@@ -3512,6 +3501,11 @@ async fn prepare_runtime_startup(
         requested_model_names,
         bin_dir,
     }))
+}
+
+// Snapshot update checks are advisory. Serving must not wait on Hub reachability.
+fn spawn_advisory_startup_task(task: impl FnOnce() + Send + 'static) {
+    std::mem::drop(tokio::task::spawn_blocking(task));
 }
 
 pub(crate) async fn run() -> Result<()> {
@@ -3613,8 +3607,9 @@ async fn run_runtime_cli(
         autoupdate::check_for_update(crate::BUILD_VERSION).await;
     }
 
-    let config = plugin::load_config(options.config.as_deref())?;
+    let mut config = plugin::load_config(options.config.as_deref())?;
     apply_runtime_config_options(&mut options, &config);
+    apply_runtime_cli_speculative_overrides(&mut config, options.speculative_overrides.as_ref());
     let startup_mesh_creation_state = resolve_startup_mesh_creation_state(&options, &config)?;
     let cli_has_explicit_models = cli_has_explicit_models(&options);
     let has_config_models = !config.models.is_empty();
@@ -3672,6 +3667,35 @@ async fn run_runtime_cli(
 fn apply_runtime_config_options(options: &mut RuntimeOptions, config: &plugin::MeshConfig) {
     options.debug |= config.runtime.debug;
     options.listen_all |= config.runtime.listen_all;
+}
+
+fn apply_runtime_cli_speculative_overrides(
+    config: &mut plugin::MeshConfig,
+    overrides: Option<&plugin::SpeculativeConfig>,
+) {
+    let Some(overrides) = overrides else {
+        return;
+    };
+    let defaults = config
+        .defaults
+        .as_ref()
+        .and_then(|defaults| defaults.speculative.as_ref())
+        .cloned();
+
+    let resolved_defaults =
+        plugin::SpeculativeConfig::with_precedence(Some(overrides), None, defaults.as_ref());
+    config
+        .defaults
+        .get_or_insert_with(plugin::ModelConfigDefaults::default)
+        .speculative = Some(resolved_defaults);
+
+    for model in &mut config.models {
+        model.speculative = Some(plugin::SpeculativeConfig::with_precedence(
+            Some(overrides),
+            model.speculative.as_ref(),
+            defaults.as_ref(),
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -5890,18 +5914,17 @@ async fn attach_local_release_attestation(node: &mesh::Node) -> Result<()> {
 }
 
 fn skippy_telemetry_options(options: &RuntimeOptions) -> skippy::SkippyTelemetryOptions {
-    if !options.debug {
-        return skippy::SkippyTelemetryOptions::off();
+    let endpoint = options
+        .skippy_metrics_otlp_grpc
+        .as_deref()
+        .map(str::trim)
+        .filter(|endpoint| !endpoint.is_empty())
+        .map(str::to_owned);
+    match (endpoint, options.debug) {
+        (Some(endpoint), true) => skippy::SkippyTelemetryOptions::debug(Some(endpoint)),
+        (Some(endpoint), false) => skippy::SkippyTelemetryOptions::summary(endpoint),
+        (None, _) => skippy::SkippyTelemetryOptions::off(),
     }
-
-    skippy::SkippyTelemetryOptions::debug(
-        options
-            .skippy_metrics_otlp_grpc
-            .as_deref()
-            .map(str::trim)
-            .filter(|endpoint| !endpoint.is_empty())
-            .map(str::to_owned),
-    )
 }
 
 fn configure_run_auto_process_state(
@@ -9206,6 +9229,28 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn advisory_startup_task_does_not_block_runtime_startup() {
+        let started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let completed = std::sync::Arc::new(AtomicBool::new(false));
+        let task_started = std::sync::Arc::clone(&started);
+        let task_completed = std::sync::Arc::clone(&completed);
+
+        spawn_advisory_startup_task(move || {
+            task_started.notify_one();
+            std::thread::sleep(Duration::from_millis(100));
+            task_completed.store(true, Ordering::Release);
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("advisory task should be scheduled");
+        assert!(
+            !completed.load(Ordering::Acquire),
+            "startup must not wait for the advisory task"
+        );
+    }
+
     #[test]
     fn noq_proto_tracing_messages_use_transport_context() {
         let message = "2026-06-11T03:49:18.033043Z  WARN noq_proto::connection: err=LastOpenPath failed closing path";
@@ -9214,6 +9259,37 @@ mod tests {
 
         assert_eq!(message, "failed closing path (err=LastOpenPath)");
         assert_eq!(context.as_deref(), Some("transport"));
+    }
+
+    #[test]
+    fn cli_speculative_overrides_take_precedence_without_dropping_model_tuning() {
+        let mut config: plugin::MeshConfig = toml::from_str(
+            r#"
+[defaults.speculative]
+strategy = "mtp-cache"
+verify_window_pipeline_depth = 2
+
+[[models]]
+model = "test/model"
+
+[models.speculative]
+ngram_max_proposal_tokens = 6
+"#,
+        )
+        .expect("config parses");
+        let mut overrides = plugin::SpeculativeConfig::default();
+        overrides.strategy = Some("mtp".to_string());
+        overrides.verify_window_pipeline_depth = Some(3);
+
+        apply_runtime_cli_speculative_overrides(&mut config, Some(&overrides));
+
+        let model = config.models[0]
+            .speculative
+            .as_ref()
+            .expect("model speculative config is resolved");
+        assert_eq!(model.strategy.as_deref(), Some("mtp"));
+        assert_eq!(model.ngram_max_proposal_tokens, Some(6));
+        assert_eq!(model.verify_window_pipeline_depth, Some(3));
     }
 
     #[test]
@@ -10686,6 +10762,41 @@ mod tests {
         assert!(metrics.contains(&hardware::Metric::GpuFacts));
         assert!(metrics.contains(&hardware::Metric::VramBytes));
         assert!(metrics.contains(&hardware::Metric::IsSoc));
+    }
+
+    #[test]
+    fn skippy_telemetry_endpoint_enables_summary_without_debug() {
+        let options = RuntimeOptions {
+            skippy_metrics_otlp_grpc: Some("http://127.0.0.1:14317".to_string()),
+            ..RuntimeOptions::default()
+        };
+
+        let telemetry = skippy_telemetry_options(&options);
+
+        assert_eq!(
+            telemetry.metrics_otlp_grpc.as_deref(),
+            Some("http://127.0.0.1:14317")
+        );
+        assert_eq!(
+            telemetry.level,
+            skippy_server::telemetry::TelemetryLevel::Summary
+        );
+    }
+
+    #[test]
+    fn skippy_telemetry_debug_keeps_debug_level_when_endpoint_is_set() {
+        let options = RuntimeOptions {
+            debug: true,
+            skippy_metrics_otlp_grpc: Some("http://127.0.0.1:14317".to_string()),
+            ..RuntimeOptions::default()
+        };
+
+        let telemetry = skippy_telemetry_options(&options);
+
+        assert_eq!(
+            telemetry.level,
+            skippy_server::telemetry::TelemetryLevel::Debug
+        );
     }
 
     #[test]

@@ -5,7 +5,8 @@ use super::{
     invalid_data,
 };
 
-pub const STAGE_STATE_VERSION: i32 = 6;
+// v8 adds the typed native-MTP reply section. Stage peers must be upgraded together.
+pub const STAGE_STATE_VERSION: i32 = 8;
 pub const MAX_STAGE_LOGIT_BIAS: usize = 256;
 pub const MAX_STAGE_PREDICTED_TOKENS: usize = 262_144;
 pub const MAX_STAGE_SIDEBAND_VALUES: usize = 1_048_576;
@@ -53,7 +54,7 @@ pub enum WireMessageKind {
     StateImport = 7,
     DecodeReadout = 8,
     DecodeLightCtx = 9,
-    VerifySpan = 10,
+    VerifyWindow = 21,
     CheckpointSession = 11,
     RestoreSession = 12,
     StateExport = 13,
@@ -85,7 +86,7 @@ impl WireMessageKind {
             Self::DecodeEmbd
                 | Self::DecodeReadout
                 | Self::DecodeLightCtx
-                | Self::VerifySpan
+                | Self::VerifyWindow
                 | Self::PrefillFinalEmbd
                 | Self::DecodeReplayFinalEmbd
         )
@@ -134,7 +135,6 @@ impl TryFrom<i32> for WireMessageKind {
             7 => Ok(Self::StateImport),
             8 => Ok(Self::DecodeReadout),
             9 => Ok(Self::DecodeLightCtx),
-            10 => Ok(Self::VerifySpan),
             11 => Ok(Self::CheckpointSession),
             12 => Ok(Self::RestoreSession),
             13 => Ok(Self::StateExport),
@@ -145,6 +145,7 @@ impl TryFrom<i32> for WireMessageKind {
             18 => Ok(Self::TryRestorePrefillDecode),
             19 => Ok(Self::TrimSession),
             20 => Ok(Self::PredictionReturnOpen),
+            21 => Ok(Self::VerifyWindow),
             _ => Err(invalid_data("unknown stage message kind")),
         }
     }
@@ -395,6 +396,18 @@ pub struct StageWireMessage {
 }
 
 impl StageWireMessage {
+    pub fn verify_window_id(&self) -> Option<i32> {
+        (self.kind == WireMessageKind::VerifyWindow).then_some(self.state.seq_id)
+    }
+
+    pub fn verify_window_base_position(&self) -> Option<i32> {
+        (self.kind == WireMessageKind::VerifyWindow).then_some(self.pos_start)
+    }
+
+    pub fn verify_window_token_count(&self) -> Option<i32> {
+        (self.kind == WireMessageKind::VerifyWindow).then_some(self.token_count)
+    }
+
     pub fn estimated_wire_bytes(&self) -> usize {
         let sampling_bytes = self.sampling.as_ref().map_or(0, |sampling| {
             STAGE_SAMPLING_CONFIG_BASE_BYTES
@@ -537,8 +550,39 @@ impl StageWireMessage {
 pub struct StageReply {
     pub kind: WireReplyKind,
     pub predicted: i32,
+    /// Target-model predictions only. Native MTP proposals are carried separately.
     pub predicted_tokens: Vec<i32>,
+    pub native_mtp_draft: Option<StageNativeMtpDraft>,
+    pub window: StageReplyWindow,
     pub stats: StageReplyStats,
+}
+
+/// A native MTP proposal associated with a stage reply.
+///
+/// This deliberately has its own reply field rather than sharing the target
+/// prediction vector. Consumers must never mistake proposal metadata for a
+/// target prediction while verifying a composite speculative window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageNativeMtpDraft {
+    pub token_ids: Vec<i32>,
+    pub proposal_compute_us: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StageReplyWindow {
+    pub window_id: i32,
+    pub accepted_len: i32,
+    pub correction_token: i32,
+}
+
+impl Default for StageReplyWindow {
+    fn default() -> Self {
+        Self {
+            window_id: 0,
+            accepted_len: 0,
+            correction_token: LLAMA_TOKEN_NULL,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -566,16 +610,16 @@ pub struct StageReplyStats {
     pub restore_downstream_wait_us: i64,
     pub restore_total_us: i64,
     pub restore_prefill_drained_replies: i64,
-    pub verify_span_compute_us: i64,
-    pub verify_span_forward_write_us: i64,
-    pub verify_span_downstream_wait_us: i64,
-    pub verify_span_total_us: i64,
-    pub verify_span_stage_count: i64,
-    pub verify_span_request_count: i64,
-    pub verify_span_token_count: i64,
-    pub verify_span_max_tokens: i64,
-    pub verify_span_checkpointed_requests: i64,
-    pub verify_span_skip_checkpoint_requests: i64,
+    pub verify_window_compute_us: i64,
+    pub verify_window_forward_write_us: i64,
+    pub verify_window_downstream_wait_us: i64,
+    pub verify_window_total_us: i64,
+    pub verify_window_stage_count: i64,
+    pub verify_window_request_count: i64,
+    pub verify_window_token_count: i64,
+    pub verify_window_max_tokens: i64,
+    pub verify_window_checkpointed_requests: i64,
+    pub verify_window_skip_checkpoint_requests: i64,
     pub prefill_edge_write_us_max: i64,
     pub prefill_edge_wait_us_max: i64,
     pub prefill_edge_total_us_max: i64,
@@ -609,18 +653,18 @@ impl StageReplyStats {
         self.restore_downstream_wait_us += other.restore_downstream_wait_us;
         self.restore_total_us += other.restore_total_us;
         self.restore_prefill_drained_replies += other.restore_prefill_drained_replies;
-        self.verify_span_compute_us += other.verify_span_compute_us;
-        self.verify_span_forward_write_us += other.verify_span_forward_write_us;
-        self.verify_span_downstream_wait_us += other.verify_span_downstream_wait_us;
-        self.verify_span_total_us += other.verify_span_total_us;
-        self.verify_span_stage_count += other.verify_span_stage_count;
-        self.verify_span_request_count += other.verify_span_request_count;
-        self.verify_span_token_count += other.verify_span_token_count;
-        self.verify_span_max_tokens = self
-            .verify_span_max_tokens
-            .max(other.verify_span_max_tokens);
-        self.verify_span_checkpointed_requests += other.verify_span_checkpointed_requests;
-        self.verify_span_skip_checkpoint_requests += other.verify_span_skip_checkpoint_requests;
+        self.verify_window_compute_us += other.verify_window_compute_us;
+        self.verify_window_forward_write_us += other.verify_window_forward_write_us;
+        self.verify_window_downstream_wait_us += other.verify_window_downstream_wait_us;
+        self.verify_window_total_us += other.verify_window_total_us;
+        self.verify_window_stage_count += other.verify_window_stage_count;
+        self.verify_window_request_count += other.verify_window_request_count;
+        self.verify_window_token_count += other.verify_window_token_count;
+        self.verify_window_max_tokens = self
+            .verify_window_max_tokens
+            .max(other.verify_window_max_tokens);
+        self.verify_window_checkpointed_requests += other.verify_window_checkpointed_requests;
+        self.verify_window_skip_checkpoint_requests += other.verify_window_skip_checkpoint_requests;
         self.prefill_edge_write_us_max = self
             .prefill_edge_write_us_max
             .max(other.prefill_edge_write_us_max);
@@ -680,16 +724,16 @@ impl StageReplyStats {
             && self.restore_downstream_wait_us == 0
             && self.restore_total_us == 0
             && self.restore_prefill_drained_replies == 0
-            && self.verify_span_compute_us == 0
-            && self.verify_span_forward_write_us == 0
-            && self.verify_span_downstream_wait_us == 0
-            && self.verify_span_total_us == 0
-            && self.verify_span_stage_count == 0
-            && self.verify_span_request_count == 0
-            && self.verify_span_token_count == 0
-            && self.verify_span_max_tokens == 0
-            && self.verify_span_checkpointed_requests == 0
-            && self.verify_span_skip_checkpoint_requests == 0
+            && self.verify_window_compute_us == 0
+            && self.verify_window_forward_write_us == 0
+            && self.verify_window_downstream_wait_us == 0
+            && self.verify_window_total_us == 0
+            && self.verify_window_stage_count == 0
+            && self.verify_window_request_count == 0
+            && self.verify_window_token_count == 0
+            && self.verify_window_max_tokens == 0
+            && self.verify_window_checkpointed_requests == 0
+            && self.verify_window_skip_checkpoint_requests == 0
             && self.prefill_edge_observation_count == 0
     }
 }

@@ -559,8 +559,78 @@ pub struct SpeculativeConfig {
     pub draft_cache_type_v: Option<String>,
     pub ngram_min: Option<u32>,
     pub ngram_max: Option<u32>,
+    pub ngram_proposer: Option<String>,
+    pub ngram_max_proposal_tokens: Option<u32>,
+    pub extension_initial_tokens: Option<u32>,
+    pub extension_max_tokens: Option<u32>,
+    pub extension_tail_backoff_proposals: Option<u32>,
+    pub native_mtp_reject_cooldown_tokens: Option<u32>,
+    pub native_mtp_suppress_cooldown_drafts: Option<bool>,
+    pub native_mtp_suppress_cooldown_draft_limit: Option<u32>,
+    pub verify_window_min_tokens: Option<u32>,
+    pub verify_window_max_tokens: Option<u32>,
+    pub verify_window_pipeline_depth: Option<u32>,
     pub spec_default: Option<BoolOrAuto>,
     pub(crate) legacy_draft_model_path_used: bool,
+}
+
+impl SpeculativeConfig {
+    /// Resolves the three supported policy layers without discarding fields
+    /// that are not overridden by a more specific layer.
+    pub fn with_precedence(
+        overrides: Option<&Self>,
+        model: Option<&Self>,
+        defaults: Option<&Self>,
+    ) -> Self {
+        macro_rules! pick {
+            ($field:ident) => {
+                overrides
+                    .and_then(|config| config.$field.clone())
+                    .or_else(|| model.and_then(|config| config.$field.clone()))
+                    .or_else(|| defaults.and_then(|config| config.$field.clone()))
+            };
+        }
+
+        Self {
+            strategy: pick!(strategy),
+            mode: pick!(mode),
+            draft_model: pick!(draft_model),
+            draft_hf_repo: pick!(draft_hf_repo),
+            draft_hf_file: pick!(draft_hf_file),
+            draft_selection_policy: pick!(draft_selection_policy),
+            pairing_fault: pick!(pairing_fault),
+            draft_max_tokens: pick!(draft_max_tokens),
+            draft_min_tokens: pick!(draft_min_tokens),
+            draft_acceptance_threshold: pick!(draft_acceptance_threshold),
+            draft_split_probability: pick!(draft_split_probability),
+            draft_gpu_layers: pick!(draft_gpu_layers),
+            draft_device: pick!(draft_device),
+            draft_threads: pick!(draft_threads),
+            draft_cache_type_k: pick!(draft_cache_type_k),
+            draft_cache_type_v: pick!(draft_cache_type_v),
+            ngram_min: pick!(ngram_min),
+            ngram_max: pick!(ngram_max),
+            ngram_proposer: pick!(ngram_proposer),
+            ngram_max_proposal_tokens: pick!(ngram_max_proposal_tokens),
+            extension_initial_tokens: pick!(extension_initial_tokens),
+            extension_max_tokens: pick!(extension_max_tokens),
+            extension_tail_backoff_proposals: pick!(extension_tail_backoff_proposals),
+            native_mtp_reject_cooldown_tokens: pick!(native_mtp_reject_cooldown_tokens),
+            native_mtp_suppress_cooldown_drafts: pick!(native_mtp_suppress_cooldown_drafts),
+            native_mtp_suppress_cooldown_draft_limit: pick!(
+                native_mtp_suppress_cooldown_draft_limit
+            ),
+            verify_window_min_tokens: pick!(verify_window_min_tokens),
+            verify_window_max_tokens: pick!(verify_window_max_tokens),
+            verify_window_pipeline_depth: pick!(verify_window_pipeline_depth),
+            spec_default: pick!(spec_default),
+            legacy_draft_model_path_used: overrides
+                .filter(|config| config.draft_model.is_some())
+                .or_else(|| model.filter(|config| config.draft_model.is_some()))
+                .or_else(|| defaults.filter(|config| config.draft_model.is_some()))
+                .is_some_and(|config| config.legacy_draft_model_path_used),
+        }
+    }
 }
 
 /// Raw deserialization helper that accepts both `draft_model` and the legacy
@@ -608,6 +678,28 @@ struct SpeculativeConfigRaw {
     #[serde(default)]
     ngram_max: Option<u32>,
     #[serde(default)]
+    ngram_proposer: Option<String>,
+    #[serde(default)]
+    ngram_max_proposal_tokens: Option<u32>,
+    #[serde(default)]
+    extension_initial_tokens: Option<u32>,
+    #[serde(default)]
+    extension_max_tokens: Option<u32>,
+    #[serde(default)]
+    extension_tail_backoff_proposals: Option<u32>,
+    #[serde(default)]
+    native_mtp_reject_cooldown_tokens: Option<u32>,
+    #[serde(default)]
+    native_mtp_suppress_cooldown_drafts: Option<bool>,
+    #[serde(default)]
+    native_mtp_suppress_cooldown_draft_limit: Option<u32>,
+    #[serde(default)]
+    verify_window_min_tokens: Option<u32>,
+    #[serde(default)]
+    verify_window_max_tokens: Option<u32>,
+    #[serde(default)]
+    verify_window_pipeline_depth: Option<u32>,
+    #[serde(default)]
     spec_default: Option<BoolOrAuto>,
 }
 
@@ -643,6 +735,17 @@ impl<'de> Deserialize<'de> for SpeculativeConfig {
             draft_cache_type_v: raw.draft_cache_type_v,
             ngram_min: raw.ngram_min,
             ngram_max: raw.ngram_max,
+            ngram_proposer: raw.ngram_proposer,
+            ngram_max_proposal_tokens: raw.ngram_max_proposal_tokens,
+            extension_initial_tokens: raw.extension_initial_tokens,
+            extension_max_tokens: raw.extension_max_tokens,
+            extension_tail_backoff_proposals: raw.extension_tail_backoff_proposals,
+            native_mtp_reject_cooldown_tokens: raw.native_mtp_reject_cooldown_tokens,
+            native_mtp_suppress_cooldown_drafts: raw.native_mtp_suppress_cooldown_drafts,
+            native_mtp_suppress_cooldown_draft_limit: raw.native_mtp_suppress_cooldown_draft_limit,
+            verify_window_min_tokens: raw.verify_window_min_tokens,
+            verify_window_max_tokens: raw.verify_window_max_tokens,
+            verify_window_pipeline_depth: raw.verify_window_pipeline_depth,
             spec_default: raw.spec_default,
             legacy_draft_model_path_used: legacy_used,
         })
@@ -656,7 +759,7 @@ impl Serialize for SpeculativeConfig {
     {
         use serde::ser::SerializeMap;
 
-        let mut map = serializer.serialize_map(Some(21))?;
+        let mut map = serializer.serialize_map(Some(32))?;
         map.serialize_entry("strategy", &self.strategy)?;
         map.serialize_entry("mode", &self.mode)?;
         if self.legacy_draft_model_path_used {
@@ -684,6 +787,32 @@ impl Serialize for SpeculativeConfig {
         map.serialize_entry("draft_cache_type_v", &self.draft_cache_type_v)?;
         map.serialize_entry("ngram_min", &self.ngram_min)?;
         map.serialize_entry("ngram_max", &self.ngram_max)?;
+        map.serialize_entry("ngram_proposer", &self.ngram_proposer)?;
+        map.serialize_entry("ngram_max_proposal_tokens", &self.ngram_max_proposal_tokens)?;
+        map.serialize_entry("extension_initial_tokens", &self.extension_initial_tokens)?;
+        map.serialize_entry("extension_max_tokens", &self.extension_max_tokens)?;
+        map.serialize_entry(
+            "extension_tail_backoff_proposals",
+            &self.extension_tail_backoff_proposals,
+        )?;
+        map.serialize_entry(
+            "native_mtp_reject_cooldown_tokens",
+            &self.native_mtp_reject_cooldown_tokens,
+        )?;
+        map.serialize_entry(
+            "native_mtp_suppress_cooldown_drafts",
+            &self.native_mtp_suppress_cooldown_drafts,
+        )?;
+        map.serialize_entry(
+            "native_mtp_suppress_cooldown_draft_limit",
+            &self.native_mtp_suppress_cooldown_draft_limit,
+        )?;
+        map.serialize_entry("verify_window_min_tokens", &self.verify_window_min_tokens)?;
+        map.serialize_entry("verify_window_max_tokens", &self.verify_window_max_tokens)?;
+        map.serialize_entry(
+            "verify_window_pipeline_depth",
+            &self.verify_window_pipeline_depth,
+        )?;
         map.serialize_entry("spec_default", &self.spec_default)?;
         map.end()
     }

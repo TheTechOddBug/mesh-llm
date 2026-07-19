@@ -99,6 +99,7 @@ impl StageOpenAiBackend {
                     "llama_stage.runtime_sessions_after",
                     &runtime_sessions_after,
                 );
+                cache_stats.prompt_ms = prefill_timer.elapsed_ms();
                 self.emit_openai_phase("stage.openai_prefill", prefill_timer, attrs);
             } else if request.prompt_token_ids.len() > 1 {
                 let prefill_timer = PhaseTimer::start();
@@ -454,6 +455,7 @@ impl StageOpenAiBackend {
                     "llama_stage.runtime_sessions_after",
                     &runtime_sessions_after,
                 );
+                cache_stats.prompt_ms = prefill_timer.elapsed_ms();
                 self.emit_openai_phase("stage.openai_prefill", prefill_timer, attrs);
                 self.telemetry.emit(
                     "stage.openai_kv_record_decision",
@@ -510,8 +512,7 @@ impl StageOpenAiBackend {
             let generation_hooks_active =
                 self.generation_hooks_active(&hook_request, hook_runtime.as_ref());
             let emit_token_debug = self.telemetry.is_debug_enabled();
-            let native_mtp_options = NativeMtpDecodeOptions::from_env()
-                .with_window(request.native_mtp_max_tokens, request.native_mtp_min_tokens);
+            let native_mtp_options = NativeMtpDecodeOptions::from_config(request.speculative);
             let mut native_mtp = NativeMtpVerifier::default();
             let mut post_prefill_hook_checked = false;
             let mut last_mid_generation_hook_at = None;
@@ -720,8 +721,10 @@ impl StageOpenAiBackend {
                     stats,
                 );
             }
+            request.speculative.insert_telemetry_attrs(&mut attrs);
             let native_mtp_stats = native_mtp.stats();
             cache_stats.native_mtp_stats = native_mtp_stats;
+            cache_stats.predicted_ms = decode_timer.elapsed_ms();
             native_mtp_stats.insert_attrs(&mut attrs);
             self.emit_openai_summary("stage.openai_decode", decode_timer, attrs);
             Ok(())

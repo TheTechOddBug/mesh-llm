@@ -32,7 +32,7 @@ use openai_frontend::{
     RetryExhaustionMode, StreamingGuardrailMode, Usage, apply_chat_hook_outcome,
     chat_mesh_hooks_enabled,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use skippy_metrics::attr as attr_key;
@@ -73,6 +73,7 @@ use crate::{
 mod admission;
 mod backend;
 mod decode_batcher;
+mod decode_scheduler;
 mod embedded_execution;
 mod embedded_generation;
 mod generation_flow;
@@ -93,6 +94,7 @@ mod wire_messages;
 use self::{
     admission::{GenerationTokenBudget, GenerationTokenBudgetRequest},
     decode_batcher::DecodeBatcher,
+    decode_scheduler::*,
     native_mtp::*,
     prefill::*,
     request::*,
@@ -146,6 +148,7 @@ pub async fn serve_openai(args: ServeOpenAiArgs) -> Result<()> {
     if args.generation_concurrency == 0 {
         bail!("--generation-concurrency must be greater than zero");
     }
+    let speculative = load_standalone_speculative_config(args.speculative_config.as_ref())?;
 
     let runtime = load_runtime(&config)?.ok_or_else(|| {
         anyhow!("serve-openai requires a stage config with model_path for tokenization and decode")
@@ -199,11 +202,9 @@ pub async fn serve_openai(args: ServeOpenAiArgs) -> Result<()> {
         draft: None,
         speculative_window: 0,
         adaptive_speculative_window: false,
-        ngram_min: 0,
-        ngram_max: 0,
-        native_mtp_enabled: false,
-        native_mtp_max_tokens: 1,
-        native_mtp_min_tokens: 0,
+        ngram_min: standalone_simple_ngram_min(&speculative),
+        ngram_max: standalone_simple_ngram_max(&speculative),
+        speculative,
         generation_limit: Arc::new(Semaphore::new(args.generation_concurrency)),
         generation_queue_depth: Arc::new(AtomicUsize::new(0)),
         generation_queue_limit: args.generation_concurrency,
@@ -227,6 +228,244 @@ pub async fn serve_openai(args: ServeOpenAiArgs) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpeculativeDecodeConfig {
+    pub requested_strategy: String,
+    pub effective_strategy: String,
+    pub native_mtp: NativeMtpProposalConfig,
+    pub ngram: Option<NgramProposalConfig>,
+    pub extension: Option<NgramExtensionConfig>,
+    pub verify_window: VerifyWindowConfig,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeMtpProposalConfig {
+    pub enabled: bool,
+    pub max_draft_tokens: usize,
+    pub min_draft_tokens: usize,
+    pub reject_cooldown_tokens: usize,
+    pub suppress_cooldown_drafts: bool,
+    pub suppress_cooldown_draft_limit: usize,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NgramProposerKind {
+    Simple,
+    Cache,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NgramProposalConfig {
+    pub kind: NgramProposerKind,
+    pub min_ngram: usize,
+    pub max_ngram: usize,
+    pub max_proposal_tokens: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NgramExtensionConfig {
+    pub initial_tokens: usize,
+    pub max_tokens: usize,
+    pub tail_backoff_proposals: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifyWindowConfig {
+    pub min_tokens: usize,
+    pub max_tokens: usize,
+    pub pipeline_depth: usize,
+}
+
+impl Default for SpeculativeDecodeConfig {
+    fn default() -> Self {
+        Self {
+            requested_strategy: "auto".to_string(),
+            effective_strategy: "disabled".to_string(),
+            native_mtp: NativeMtpProposalConfig {
+                enabled: false,
+                max_draft_tokens: 1,
+                min_draft_tokens: 0,
+                reject_cooldown_tokens: 0,
+                suppress_cooldown_drafts: false,
+                suppress_cooldown_draft_limit: 0,
+            },
+            ngram: None,
+            extension: None,
+            verify_window: VerifyWindowConfig {
+                min_tokens: 1,
+                max_tokens: 4,
+                pipeline_depth: 1,
+            },
+        }
+    }
+}
+
+impl SpeculativeDecodeConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.requested_strategy.trim().is_empty() || self.effective_strategy.trim().is_empty() {
+            bail!("speculative decode strategies must not be empty");
+        }
+        if self.native_mtp.min_draft_tokens > self.native_mtp.max_draft_tokens {
+            bail!("native MTP min_draft_tokens must not exceed max_draft_tokens");
+        }
+        if let Some(ngram) = &self.ngram
+            && (ngram.min_ngram == 0
+                || ngram.min_ngram > ngram.max_ngram
+                || ngram.max_proposal_tokens < ngram.min_ngram)
+        {
+            bail!(
+                "N-gram proposer requires 0 < min_ngram <= max_ngram and max_proposal_tokens >= min_ngram"
+            );
+        }
+        if let Some(ngram) = &self.ngram
+            && ngram.kind == NgramProposerKind::Cache
+            && ngram.max_ngram > skippy_runtime::NGRAM_CACHE_MAX_NGRAM
+        {
+            bail!(
+                "cache N-gram proposer max_ngram must not exceed llama.cpp limit {}",
+                skippy_runtime::NGRAM_CACHE_MAX_NGRAM
+            );
+        }
+        if self.extension.is_some() && (!self.native_mtp.enabled || self.ngram.is_none()) {
+            bail!("N-gram extension requires both native MTP and an N-gram proposer");
+        }
+        if let Some(extension) = &self.extension
+            && (extension.initial_tokens == 0
+                || extension.initial_tokens > extension.max_tokens
+                || extension.max_tokens == 0)
+        {
+            bail!("N-gram extension requires 0 < initial_tokens <= max_tokens");
+        }
+        if self.verify_window.min_tokens == 0
+            || self.verify_window.min_tokens > self.verify_window.max_tokens
+            || self.verify_window.pipeline_depth == 0
+        {
+            bail!("verify window requires 0 < min_tokens <= max_tokens and pipeline_depth > 0");
+        }
+        Ok(())
+    }
+
+    fn insert_telemetry_attrs(&self, attrs: &mut BTreeMap<String, Value>) {
+        attrs.insert(
+            "llama_stage.spec.requested_strategy".to_string(),
+            json!(self.requested_strategy),
+        );
+        attrs.insert(
+            "llama_stage.spec.effective_strategy".to_string(),
+            json!(self.effective_strategy),
+        );
+    }
+}
+
+fn load_standalone_speculative_config(path: Option<&PathBuf>) -> Result<SpeculativeDecodeConfig> {
+    let config = match path {
+        Some(path) => load_json(path)
+            .with_context(|| format!("load speculative decode config {}", path.display()))?,
+        None => SpeculativeDecodeConfig::default(),
+    };
+    config.validate()?;
+    Ok(config)
+}
+
+fn standalone_simple_ngram_min(config: &SpeculativeDecodeConfig) -> usize {
+    config
+        .ngram
+        .as_ref()
+        .filter(|ngram| ngram.kind == NgramProposerKind::Simple)
+        .map_or(0, |ngram| ngram.min_ngram)
+}
+
+fn standalone_simple_ngram_max(config: &SpeculativeDecodeConfig) -> usize {
+    config
+        .ngram
+        .as_ref()
+        .filter(|ngram| ngram.kind == NgramProposerKind::Simple)
+        .map_or(0, |ngram| ngram.max_proposal_tokens.min(ngram.max_ngram))
+}
+
+#[cfg(test)]
+mod standalone_speculative_config_tests {
+    use super::*;
+
+    #[test]
+    fn standalone_speculative_config_rejects_invalid_composite_plan() {
+        let config = SpeculativeDecodeConfig {
+            extension: Some(NgramExtensionConfig {
+                initial_tokens: 2,
+                max_tokens: 4,
+                tail_backoff_proposals: 1,
+            }),
+            ..SpeculativeDecodeConfig::default()
+        };
+
+        let error = config.validate().expect_err("extension requires proposers");
+
+        assert!(
+            error
+                .to_string()
+                .contains("requires both native MTP and an N-gram proposer")
+        );
+    }
+
+    #[test]
+    fn standalone_speculative_config_round_trips_cache_composite() {
+        let config = SpeculativeDecodeConfig {
+            requested_strategy: "mtp-cache".to_string(),
+            effective_strategy: "native-mtp-cache".to_string(),
+            native_mtp: NativeMtpProposalConfig {
+                enabled: true,
+                max_draft_tokens: 2,
+                ..SpeculativeDecodeConfig::default().native_mtp
+            },
+            ngram: Some(NgramProposalConfig {
+                kind: NgramProposerKind::Cache,
+                min_ngram: 2,
+                max_ngram: 4,
+                max_proposal_tokens: 6,
+            }),
+            extension: Some(NgramExtensionConfig {
+                initial_tokens: 2,
+                max_tokens: 6,
+                tail_backoff_proposals: 2,
+            }),
+            ..SpeculativeDecodeConfig::default()
+        };
+
+        let json = serde_json::to_string(&config).expect("serialize plan");
+        let decoded: SpeculativeDecodeConfig = serde_json::from_str(&json).expect("parse plan");
+
+        assert_eq!(decoded, config);
+        decoded.validate().expect("valid composite plan");
+    }
+
+    #[test]
+    fn standalone_speculative_config_rejects_cache_windows_above_llama_limit() {
+        let config = SpeculativeDecodeConfig {
+            ngram: Some(NgramProposalConfig {
+                kind: NgramProposerKind::Cache,
+                min_ngram: 2,
+                max_ngram: skippy_runtime::NGRAM_CACHE_MAX_NGRAM + 1,
+                max_proposal_tokens: 6,
+            }),
+            ..SpeculativeDecodeConfig::default()
+        };
+
+        let error = config.validate().expect_err("cache max must be bounded");
+
+        assert!(
+            error
+                .to_string()
+                .contains("must not exceed llama.cpp limit 4")
+        );
+    }
+}
+
 #[derive(Clone)]
 pub struct EmbeddedOpenAiArgs {
     pub bind_addr: SocketAddr,
@@ -246,6 +485,7 @@ pub struct EmbeddedOpenAiArgs {
     pub speculative_window: usize,
     pub adaptive_speculative_window: bool,
     pub draft_n_gpu_layers: Option<i32>,
+    pub speculative: SpeculativeDecodeConfig,
     pub ngram_min: usize,
     pub ngram_max: usize,
     pub native_mtp_enabled: bool,
@@ -577,9 +817,6 @@ pub fn embedded_openai_backend(args: EmbeddedOpenAiArgs) -> Result<EmbeddedOpenA
         prefill_reply_credit_limit,
         lane_pool,
         prediction_returns: args.prediction_returns.clone(),
-        native_mtp_enabled: args.native_mtp_enabled,
-        native_mtp_max_tokens: args.native_mtp_max_tokens,
-        native_mtp_min_tokens: args.native_mtp_min_tokens,
     };
     args.telemetry
         .emit("stage.openai_server_start", lifecycle_attrs(&args.config));
@@ -610,9 +847,7 @@ pub fn embedded_openai_backend(args: EmbeddedOpenAiArgs) -> Result<EmbeddedOpenA
         adaptive_speculative_window: args.adaptive_speculative_window,
         ngram_min: args.ngram_min,
         ngram_max: args.ngram_max,
-        native_mtp_enabled: args.native_mtp_enabled,
-        native_mtp_max_tokens: args.native_mtp_max_tokens,
-        native_mtp_min_tokens: args.native_mtp_min_tokens,
+        speculative: args.speculative,
         generation_limit: Arc::new(Semaphore::new(args.generation_concurrency)),
         generation_queue_depth: Arc::new(AtomicUsize::new(0)),
         generation_queue_limit: args.generation_concurrency,
@@ -656,9 +891,7 @@ struct StageOpenAiBackend {
     adaptive_speculative_window: bool,
     ngram_min: usize,
     ngram_max: usize,
-    native_mtp_enabled: bool,
-    native_mtp_max_tokens: usize,
-    native_mtp_min_tokens: usize,
+    speculative: SpeculativeDecodeConfig,
     generation_limit: Arc<Semaphore>,
     generation_queue_depth: Arc<AtomicUsize>,
     generation_queue_limit: usize,
@@ -904,9 +1137,6 @@ enum OpenAiBackendMode {
         prefill_reply_credit_limit: usize,
         lane_pool: Option<Arc<PersistentStageLanePool>>,
         prediction_returns: Option<Arc<PredictionReturnHub>>,
-        native_mtp_enabled: bool,
-        native_mtp_max_tokens: usize,
-        native_mtp_min_tokens: usize,
     },
 }
 
@@ -947,6 +1177,16 @@ struct PrefillTransportEstimate {
 /// lane's generation reads stay blocking.
 const LANE_READY_READ_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Steady-state (post-warmup) lane reconnect deadline. A live split peer at
+/// LAN/WAN RTT answers the ready handshake in milliseconds; only a dead or
+/// wedged downstream stage waits this long. Keeping the steady-state deadline
+/// short turns "a new request routed to a dead stage" into a fast error (~3s)
+/// instead of the ~20s warmup deadline. The long `LANE_READY_READ_TIMEOUT` is
+/// only needed during pool warmup, when the downstream stage may still be
+/// loading its model; a mid-life reconnect to an already-serving mesh has no
+/// such excuse for a multi-second silence.
+const LANE_STEADY_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
 impl PersistentStageLanePool {
     const PREFILL_TRANSPORT_EWMA_ALPHA: f64 = 0.25;
 
@@ -970,7 +1210,9 @@ impl PersistentStageLanePool {
         });
         let timer = PhaseTimer::start();
         for _ in 0..capacity {
-            let lane = pool.connect_lane()?;
+            // Warmup: the downstream stage may still be loading its model, so
+            // allow the full ready deadline.
+            let lane = pool.connect_lane(LANE_READY_READ_TIMEOUT)?;
             pool.return_lane(lane);
         }
         let mut attrs = lifecycle_attrs(config);
@@ -1000,9 +1242,21 @@ impl PersistentStageLanePool {
                 .map_err(|_| OpenAiError::backend("persistent lane pool lock poisoned"))?;
             lanes.pop()
         };
-        let lane = match lane {
+        // A pooled lane may be stale: if the downstream stage died while the
+        // lane was checked in, the cached TCP stream is dead but reusing it
+        // would block forever on the next generation read (the handshake
+        // read-timeout is deliberately cleared so long generations don't
+        // truncate). Probe liveness before reuse and drop a dead lane so we
+        // reconnect with the short steady-state deadline instead of hanging.
+        let live_pooled = lane.filter(|lane| lane_stream_is_live(&lane.stream));
+        let lane = match live_pooled {
             Some(lane) => lane,
-            None => self.connect_lane().map_err(openai_backend_error)?,
+            // Steady-state reconnect: the mesh is already serving, so a healthy
+            // downstream answers fast. Use the short deadline so a request
+            // routed to a dead stage fails quickly instead of stalling ~20s.
+            None => self
+                .connect_lane(LANE_STEADY_CONNECT_TIMEOUT)
+                .map_err(openai_backend_error)?,
         };
         let mut attrs = BTreeMap::from([
             (
@@ -1111,7 +1365,10 @@ impl PersistentStageLanePool {
             "llama_stage.openai_downstream_retired_lane_id".to_string(),
             json!(retired_lane_id),
         );
-        match self.connect_lane() {
+        // Replacing a retired lane on an already-serving mesh is a steady-state
+        // reconnect: a healthy downstream answers fast, a dead one should fail
+        // fast rather than stall.
+        match self.connect_lane(LANE_STEADY_CONNECT_TIMEOUT) {
             Ok(lane) => {
                 attrs.insert(
                     "llama_stage.openai_downstream_lane_id".to_string(),
@@ -1145,16 +1402,16 @@ impl PersistentStageLanePool {
         }
     }
 
-    fn connect_lane(&self) -> Result<PersistentStageLane> {
+    fn connect_lane(&self, ready_timeout: Duration) -> Result<PersistentStageLane> {
         let lane_id = self.next_lane_id.fetch_add(1, Ordering::Relaxed);
         let timer = PhaseTimer::start();
         // Single bounded attempt. `connect_binary_downstream` already retries
         // the TCP connect internally (its own attempt budget), and the ready
-        // handshake read below is bounded by `LANE_READY_READ_TIMEOUT`. An extra
+        // handshake read below is bounded by `ready_timeout`. An extra
         // outer retry here only multiplies the worst-case stall — a dead peer
         // would burn (connect budget × outer attempts) before failing (see PR
         // #1011 review). Bring-up wants a single, predictable deadline.
-        let stream = self.connect_lane_once(lane_id).inspect_err(|error| {
+        let stream = self.connect_lane_once(lane_id, ready_timeout).inspect_err(|error| {
             eprintln!(
                 "openai downstream lane handshake failed: stage_id={} lane_id={lane_id}: {error:#}",
                 self.config.stage_id,
@@ -1187,10 +1444,12 @@ impl PersistentStageLanePool {
 
     /// Perform a single connect + ready-handshake attempt for one lane.
     ///
-    /// Returns the connected, ready `TcpStream` on success. Callers retry this
-    /// with a backoff so a transient short read on `recv_ready` does not fail
-    /// lane creation outright.
-    fn connect_lane_once(&self, lane_id: u64) -> Result<TcpStream> {
+    /// Returns the connected, ready `TcpStream` on success. `ready_timeout`
+    /// bounds the handshake read: use `LANE_READY_READ_TIMEOUT` during pool
+    /// warmup (the downstream stage may still be loading) and the shorter
+    /// `LANE_STEADY_CONNECT_TIMEOUT` for mid-life reconnects on an
+    /// already-serving mesh, so a dead stage fails fast instead of stalling.
+    fn connect_lane_once(&self, lane_id: u64, ready_timeout: Duration) -> Result<TcpStream> {
         let mut stream = connect_binary_downstream(&self.config, self.timeout_secs)?
             .ok_or_else(|| anyhow!("embedded stage0 has no downstream"))?;
         let local_addr = stream.local_addr().ok();
@@ -1201,30 +1460,66 @@ impl PersistentStageLanePool {
         );
         send_client_ready_hello_if_enabled(&mut stream)
             .context("send persistent downstream lane client ready hello")?;
-        // Bound the ready handshake read. `recv_ready` is a blocking
-        // `read_exact`; without a timeout a stalled or half-dead downstream
-        // connection hangs lane creation forever (observed as a lane stuck in
-        // "waiting ready" that never completes and never errors). A single
-        // bounded read timeout turns the stall into an error. Both the set and
-        // the clear are propagated: if the set fails, `recv_ready` would be
-        // unbounded (defeating the fix); if the clear fails, the handshake
-        // timeout would leak into the persistent lane's later generation reads
-        // and truncate long generations.
-        stream
-            .set_read_timeout(Some(LANE_READY_READ_TIMEOUT))
-            .context("set persistent downstream lane ready read timeout")?;
-        let ready =
-            recv_ready(&mut stream).context("persistent downstream lane did not become ready");
-        stream
-            .set_read_timeout(None)
-            .context("clear persistent downstream lane ready read timeout")?;
-        ready?;
+        receive_persistent_lane_ready(&mut stream, ready_timeout)?;
         eprintln!(
             "openai downstream lane received ready: stage_id={} lane_id={lane_id} local={local_addr:?} peer={peer_addr:?}",
             self.config.stage_id
         );
         Ok(stream)
     }
+}
+
+/// Read the lane ready handshake with a bounded deadline.
+///
+/// `recv_ready` is a blocking `read_exact`; without a read timeout a stalled or
+/// half-dead downstream connection hangs lane creation forever (observed as a
+/// lane stuck in "waiting ready" that never completes and never errors). Set the
+/// deadline, read, then clear it so the persistent lane's later generation reads
+/// stay blocking. Both the set and the clear are propagated: if the set fails,
+/// `recv_ready` would be unbounded (defeating the fix); if the clear fails, the
+/// handshake timeout would leak into generation reads and truncate long outputs.
+fn receive_persistent_lane_ready(stream: &mut TcpStream, timeout: Duration) -> Result<()> {
+    stream
+        .set_read_timeout(Some(timeout))
+        .context("set persistent downstream lane ready timeout")?;
+    let ready = recv_ready(&mut *stream).context("persistent downstream lane did not become ready");
+    stream
+        .set_read_timeout(None)
+        .context("restore persistent downstream lane read timeout")?;
+    ready
+}
+
+/// Cheap liveness probe for a pooled lane before reuse.
+///
+/// A pooled lane whose downstream stage died is a dead TCP stream; reusing it
+/// would block the next generation read forever (the handshake read-timeout is
+/// cleared for pooled lanes so long generations don't truncate). A nonblocking
+/// peek distinguishes cases without consuming data:
+///
+/// - `Ok(0)` => peer sent EOF / closed => dead, discard.
+/// - `Err(WouldBlock)` => connection open, no pending data => healthy, reuse.
+/// - other `Err` (reset, etc.) => dead, discard.
+///
+/// Between requests a healthy lane has no unread bytes, so a nonzero peek would
+/// be unexpected protocol data; treat that as unsafe-to-reuse and discard too.
+/// The blocking mode is always restored so the caller's reads are unaffected.
+fn lane_stream_is_live(stream: &TcpStream) -> bool {
+    use std::io::ErrorKind;
+    if stream.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let mut probe = [0u8; 1];
+    let live = match stream.peek(&mut probe) {
+        Ok(0) => false,
+        Ok(_) => false,
+        Err(ref e) if e.kind() == ErrorKind::WouldBlock => true,
+        Err(_) => false,
+    };
+    // Restore blocking mode; if we can't, the lane is not safe to hand back.
+    if stream.set_nonblocking(false).is_err() {
+        return false;
+    }
+    live
 }
 
 fn ewma(old: f64, sample: f64) -> f64 {
@@ -1314,7 +1609,6 @@ fn prompt_cache_retention_label(retention: openai_frontend::PromptCacheRetention
     }
 }
 
-#[derive(Clone, Copy)]
 struct GenerationCacheStats {
     status: &'static str,
     cached_prompt_tokens: u32,
@@ -1322,6 +1616,11 @@ struct GenerationCacheStats {
     suffix_prefill_tokens: u32,
     hit_kind: Option<&'static str>,
     native_mtp_stats: NativeMtpStats,
+    native_mtp_decode_telemetry: Option<NativeMtpDecodeTelemetry>,
+    verify_window_pipeline_stats: Option<VerifyWindowPipelineStats>,
+    speculative_stats: Option<OpenAiSpeculativeStats>,
+    prompt_ms: f64,
+    predicted_ms: f64,
 }
 
 impl Default for GenerationCacheStats {
@@ -1333,6 +1632,11 @@ impl Default for GenerationCacheStats {
             suffix_prefill_tokens: 0,
             hit_kind: None,
             native_mtp_stats: NativeMtpStats::default(),
+            native_mtp_decode_telemetry: None,
+            verify_window_pipeline_stats: None,
+            speculative_stats: None,
+            prompt_ms: 0.0,
+            predicted_ms: 0.0,
         }
     }
 }
@@ -1763,6 +2067,19 @@ fn chat_response_from_generated_text(
     .with_timings(output.timings())
 }
 
+fn completion_response_from_generated_text(
+    model: String,
+    output: &GeneratedText,
+) -> CompletionResponse {
+    CompletionResponse::new_with_reason(
+        model,
+        output.text.clone(),
+        output.usage(),
+        output.finish_reason,
+    )
+    .with_timings(output.timings())
+}
+
 fn parsed_chat_message_from_json(
     message_json: &str,
     request: &ChatCompletionRequest,
@@ -1932,9 +2249,8 @@ struct LocalGeneration<'a> {
     max_tokens: u32,
     sampling: &'a SamplingConfig,
     chat_sampling_metadata: Option<&'a str>,
+    speculative: &'a SpeculativeDecodeConfig,
     native_mtp_enabled: bool,
-    native_mtp_max_tokens: usize,
-    native_mtp_min_tokens: usize,
     hook_request: Option<ChatCompletionRequest>,
     hook_runtime: Option<tokio::runtime::Handle>,
     cancellation: Option<&'a openai_frontend::CancellationToken>,
@@ -1953,11 +2269,11 @@ struct EmbeddedStageZeroGeneration<'a> {
     draft: Option<Arc<Mutex<DraftRunner>>>,
     speculative_window: usize,
     adaptive_speculative_window: bool,
+    speculative: &'a SpeculativeDecodeConfig,
     ngram_min: usize,
     ngram_max: usize,
     native_mtp_enabled: bool,
     native_mtp_max_tokens: usize,
-    native_mtp_min_tokens: usize,
     prompt_token_ids: &'a [i32],
     max_tokens: u32,
     sampling: &'a SamplingConfig,
@@ -2363,6 +2679,11 @@ where
             suffix_prefill_tokens: cache_stats.suffix_prefill_tokens,
             cache_hit_kind: cache_stats.hit_kind,
             native_mtp_stats: cache_stats.native_mtp_stats,
+            native_mtp_decode_telemetry: cache_stats.native_mtp_decode_telemetry,
+            verify_window_pipeline_stats: cache_stats.verify_window_pipeline_stats,
+            speculative_stats: cache_stats.speculative_stats,
+            prompt_ms: cache_stats.prompt_ms,
+            predicted_ms: cache_stats.predicted_ms,
             text: self.text,
             finish_reason: self.finish_reason,
             detokenize_ms: self.metrics.detokenize_ms,
@@ -2381,6 +2702,11 @@ struct GeneratedText {
     suffix_prefill_tokens: u32,
     cache_hit_kind: Option<&'static str>,
     native_mtp_stats: NativeMtpStats,
+    native_mtp_decode_telemetry: Option<NativeMtpDecodeTelemetry>,
+    verify_window_pipeline_stats: Option<VerifyWindowPipelineStats>,
+    speculative_stats: Option<OpenAiSpeculativeStats>,
+    prompt_ms: f64,
+    predicted_ms: f64,
     text: String,
     finish_reason: FinishReason,
     detokenize_ms: f64,
@@ -2395,14 +2721,26 @@ impl GeneratedText {
     }
 
     fn timings(&self) -> Option<BTreeMap<String, Value>> {
-        if !self.native_mtp_stats.enabled() {
-            return None;
-        }
-
         let stats = self.native_mtp_stats;
-        Some(BTreeMap::from([
-            ("draft_n".to_string(), json!(stats.drafted_tokens)),
-            ("draft_n_accepted".to_string(), json!(stats.accepted_tokens)),
+        let (drafted_tokens, accepted_tokens) = self
+            .native_mtp_decode_telemetry
+            .and_then(NativeMtpDecodeTelemetry::composite_proposal_totals)
+            .unwrap_or((stats.drafted_tokens, stats.accepted_tokens));
+        let mut timings = BTreeMap::from([
+            ("prompt_n".to_string(), json!(self.prompt_tokens)),
+            ("prompt_ms".to_string(), json!(self.prompt_ms)),
+            (
+                "prompt_per_second".to_string(),
+                json!(tokens_per_second(self.prompt_tokens, self.prompt_ms)),
+            ),
+            ("predicted_n".to_string(), json!(self.completion_tokens)),
+            ("predicted_ms".to_string(), json!(self.predicted_ms)),
+            (
+                "predicted_per_second".to_string(),
+                json!(tokens_per_second(self.completion_tokens, self.predicted_ms)),
+            ),
+            ("draft_n".to_string(), json!(drafted_tokens)),
+            ("draft_n_accepted".to_string(), json!(accepted_tokens)),
             (
                 "native_mtp_rejected".to_string(),
                 json!(stats.rejected_tokens),
@@ -2419,7 +2757,25 @@ impl GeneratedText {
                 "native_mtp_verification_compute_us".to_string(),
                 json!(stats.verification_compute_us),
             ),
-        ]))
+        ]);
+        if let Some(telemetry) = self.native_mtp_decode_telemetry {
+            telemetry.insert_response_timings(&mut timings);
+        }
+        if let Some(stats) = self.verify_window_pipeline_stats {
+            stats.insert_response_timings(&mut timings);
+        }
+        if let Some(stats) = self.speculative_stats.as_ref() {
+            stats.insert_response_timings(&mut timings);
+        }
+        Some(timings)
+    }
+}
+
+fn tokens_per_second(token_count: u32, elapsed_ms: f64) -> f64 {
+    if elapsed_ms > 0.0 {
+        f64::from(token_count) * 1_000.0 / elapsed_ms
+    } else {
+        0.0
     }
 }
 

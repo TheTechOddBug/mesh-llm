@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use std::io::Cursor;
 use std::{
     env, fs,
-    net::SocketAddr,
+    net::{SocketAddr, TcpListener, TcpStream},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -1096,6 +1096,11 @@ fn chat_response_from_parsed_message_separates_reasoning_content() {
             verification_compute_us: 200,
             ..NativeMtpStats::default()
         },
+        native_mtp_decode_telemetry: None,
+        verify_window_pipeline_stats: None,
+        speculative_stats: None,
+        prompt_ms: 20.0,
+        predicted_ms: 100.0,
         text: "Checked facts first.</think>Final answer.".to_string(),
         finish_reason: FinishReason::Stop,
         detokenize_ms: 0.0,
@@ -1121,6 +1126,106 @@ fn chat_response_from_parsed_message_separates_reasoning_content() {
     );
     assert_eq!(message.tool_calls, None);
     assert_eq!(response.choices[0].finish_reason, Some(FinishReason::Stop));
+
+    let completion = completion_response_from_generated_text("qwen".to_string(), &output);
+    let timings = completion
+        .timings
+        .as_ref()
+        .expect("completion native MTP timings");
+    assert_eq!(timings.get("draft_n"), Some(&json!(7)));
+    assert_eq!(timings.get("draft_n_accepted"), Some(&json!(5)));
+    assert_eq!(timings.get("predicted_per_second"), Some(&json!(70.0)));
+}
+
+#[test]
+fn generated_text_timings_are_present_without_native_mtp() {
+    let output = GeneratedText {
+        prompt_tokens: 4,
+        completion_tokens: 8,
+        cache_status: "disabled",
+        cached_prompt_tokens: 0,
+        matched_prefix_tokens: 0,
+        suffix_prefill_tokens: 0,
+        cache_hit_kind: None,
+        native_mtp_stats: NativeMtpStats::default(),
+        native_mtp_decode_telemetry: None,
+        verify_window_pipeline_stats: None,
+        speculative_stats: None,
+        prompt_ms: 20.0,
+        predicted_ms: 100.0,
+        text: "Paris".to_string(),
+        finish_reason: FinishReason::Stop,
+        detokenize_ms: 0.0,
+        text_emit_ms: 0.0,
+        eog_check_ms: 0.0,
+    };
+
+    let timings = output.timings().expect("standard timings");
+    assert_eq!(timings.get("draft_n"), Some(&json!(0)));
+    assert_eq!(timings.get("draft_n_accepted"), Some(&json!(0)));
+    assert_eq!(timings.get("prompt_per_second"), Some(&json!(200.0)));
+    assert_eq!(timings.get("predicted_per_second"), Some(&json!(80.0)));
+}
+
+#[test]
+fn generated_text_timings_prefer_composite_proposal_totals() {
+    let mut counters = NativeMtpDecodeCounters::default();
+    let proposal = CompositeProposalProvider::from_options(NativeMtpDecodeOptions {
+        max_draft_tokens: 1,
+        min_draft_tokens: 0,
+        reject_cooldown_tokens: 0,
+        suppress_cooldown_drafts: false,
+        suppress_cooldown_draft_limit: 0,
+        ngram_hybrid: true,
+        ngram_size: 2,
+        ngram_initial_extension_tokens: 2,
+        ngram_max_proposal_tokens: 4,
+        ngram_tail_backoff_proposals: 2,
+        verify_window_min_tokens: 1,
+        verify_window_max_tokens: 4,
+    })
+    .propose(&[], &[0, 0, 2, 3, 9, 1, 7, 8, 2, 3], 4);
+    counters.observe_hybrid_proposal(&proposal, 4);
+    let output = GeneratedText {
+        prompt_tokens: 4,
+        completion_tokens: 8,
+        cache_status: "disabled",
+        cached_prompt_tokens: 0,
+        matched_prefix_tokens: 0,
+        suffix_prefill_tokens: 0,
+        cache_hit_kind: None,
+        native_mtp_stats: NativeMtpStats::default(),
+        native_mtp_decode_telemetry: Some(NativeMtpDecodeTelemetry::new(
+            NativeMtpDecodeOptions {
+                max_draft_tokens: 1,
+                min_draft_tokens: 0,
+                reject_cooldown_tokens: 0,
+                suppress_cooldown_drafts: false,
+                suppress_cooldown_draft_limit: 0,
+                ngram_hybrid: true,
+                ngram_size: 2,
+                ngram_initial_extension_tokens: 2,
+                ngram_max_proposal_tokens: 4,
+                ngram_tail_backoff_proposals: 2,
+                verify_window_min_tokens: 1,
+                verify_window_max_tokens: 4,
+            },
+            counters,
+        )),
+        verify_window_pipeline_stats: None,
+        speculative_stats: None,
+        prompt_ms: 20.0,
+        predicted_ms: 100.0,
+        text: "ok".to_string(),
+        finish_reason: FinishReason::Stop,
+        detokenize_ms: 0.0,
+        text_emit_ms: 0.0,
+        eog_check_ms: 0.0,
+    };
+
+    let timings = output.timings().expect("timings");
+    assert_eq!(timings.get("draft_n"), Some(&json!(4)));
+    assert_eq!(timings.get("draft_n_accepted"), Some(&json!(4)));
 }
 
 #[test]
@@ -1498,9 +1603,7 @@ fn local_openai_backend(config: StageConfig) -> Result<StageOpenAiBackend> {
         adaptive_speculative_window: false,
         ngram_min: 0,
         ngram_max: 0,
-        native_mtp_enabled: false,
-        native_mtp_max_tokens: 1,
-        native_mtp_min_tokens: 0,
+        speculative: SpeculativeDecodeConfig::default(),
         generation_limit: Arc::new(Semaphore::new(1)),
         generation_queue_depth: Arc::new(AtomicUsize::new(0)),
         generation_queue_limit: 1,
@@ -1686,18 +1789,24 @@ async fn real_multimodal_split_smoke_when_fixture_is_set() -> Result<()> {
             prefill_reply_credit_limit: 0,
             lane_pool: Some(lane_pool),
             prediction_returns: None,
-            native_mtp_enabled: true,
-            native_mtp_max_tokens: 3,
-            native_mtp_min_tokens: 0,
         },
         draft: None,
         speculative_window: 0,
         adaptive_speculative_window: false,
         ngram_min: 0,
         ngram_max: 0,
-        native_mtp_enabled: true,
-        native_mtp_max_tokens: 3,
-        native_mtp_min_tokens: 0,
+        speculative: SpeculativeDecodeConfig {
+            native_mtp: NativeMtpProposalConfig {
+                enabled: true,
+                max_draft_tokens: 3,
+                min_draft_tokens: 0,
+                reject_cooldown_tokens: 0,
+                suppress_cooldown_drafts: false,
+                suppress_cooldown_draft_limit: 0,
+            },
+            effective_strategy: "native-mtp".to_string(),
+            ..SpeculativeDecodeConfig::default()
+        },
         generation_limit: Arc::new(Semaphore::new(1)),
         generation_queue_depth: Arc::new(AtomicUsize::new(0)),
         generation_queue_limit: 1,
@@ -2726,6 +2835,71 @@ fn prefill_transport_ewma_seeds_adaptive_ramp() {
     planner.observe(pool.prefill_transport_seed().unwrap());
 
     assert_eq!(planner.chunk_size_for(0, 512), 256);
+}
+
+#[test]
+fn persistent_lane_ready_handshake_times_out_for_silent_downstream() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (_stream, _) = listener.accept().unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+    });
+    let mut client = TcpStream::connect(address).unwrap();
+
+    let error = receive_persistent_lane_ready(&mut client, Duration::from_millis(25)).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("persistent downstream lane did not become ready")
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn steady_state_lane_reconnect_deadline_is_much_shorter_than_warmup() {
+    // A mid-life reconnect to an already-serving mesh must fail fast so a new
+    // request routed to a dead stage errors quickly instead of stalling for the
+    // full warmup deadline. Guard the invariant that the steady-state deadline
+    // stays well under the warmup deadline.
+    assert!(
+        LANE_STEADY_CONNECT_TIMEOUT < LANE_READY_READ_TIMEOUT,
+        "steady-state reconnect deadline must be shorter than the warmup deadline"
+    );
+    assert!(
+        LANE_STEADY_CONNECT_TIMEOUT <= Duration::from_secs(5),
+        "steady-state reconnect deadline must stay small enough to fail fast on a dead stage"
+    );
+}
+
+#[test]
+fn steady_state_ready_handshake_times_out_fast_for_silent_downstream() {
+    // A downstream that accepts the TCP connection but never sends the ready
+    // frame must be bounded by the supplied deadline, not hang. This mirrors the
+    // silent-downstream case a dead split stage produces on a new request.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (_stream, _) = listener.accept().unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+    });
+    let mut client = TcpStream::connect(address).unwrap();
+
+    let start = std::time::Instant::now();
+    let error = receive_persistent_lane_ready(&mut client, Duration::from_millis(25)).unwrap_err();
+    let elapsed = start.elapsed();
+
+    assert!(
+        error
+            .to_string()
+            .contains("persistent downstream lane did not become ready")
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "handshake read must fail within the supplied deadline, took {elapsed:?}"
+    );
+    server.join().unwrap();
 }
 
 #[test]

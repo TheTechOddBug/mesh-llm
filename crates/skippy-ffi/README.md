@@ -52,11 +52,10 @@ same Rust crate.
 
 ## ABI Contract
 
-The staged ABI is versioned as `0.1.26`. The patch header in
-`third_party/llama.cpp/patches/0083-skippy-add-model-open-runtime-events-ABI.patch`
-and the Rust constants in `crates/skippy-ffi/src/lib.rs` are the source of
-truth, so keep this README aligned with those files instead of treating it as
-canonical prose.
+The staged ABI is versioned as `0.1.32`. The patch header in
+`third_party/llama.cpp/patches/` and the Rust constants in
+`crates/skippy-ffi/src/lib.rs` are the source of truth, so keep this README
+aligned with those files instead of treating it as canonical prose.
 
 Version `0` is still experimental, so callers should treat the ABI as
 feature-probed rather than permanently stable.
@@ -66,6 +65,13 @@ The runtime-event additions are part of that `0.1.26` bump. They add versioned
 `detail_len` fixed-width as `u64`, and pass the reporter as a separate pointer
 argument on the `_with_events` model-open entrypoints instead of extending
 `RuntimeConfig`.
+
+Version `0.1.31` adds `skippy_ngram_simple_draft`, a stateless adapter for
+llama.cpp's upstream self-speculative `ngram-simple` proposer.
+
+Version `0.1.32` adds a request-owned adapter for llama.cpp's upstream
+`ngram-cache` proposer. Callers reset or append only target-committed tokens;
+an optional provisional continuation is read-only input to drafting.
 
 The Rust FFI layer binds `skippy_abi_features`. This README records ABI intent
 and compatibility expectations only; higher-level gating belongs in
@@ -144,6 +150,9 @@ read it directly:
 | `CHAT_SAMPLING_GRAMMAR` | `1 << 22` | Session-local llama.cpp grammar-constrained sampling from chat template metadata |
 | `BACKEND_DEVICES` | `1 << 23` | Backend-device capability reporting |
 | `RUNTIME_EVENTS` | `1 << 24` | `_with_events` model-open entrypoints and runtime-event callbacks |
+| `NATIVE_MTP_N1` | `1 << 25` | Typed, non-frame native MTP draft sideband |
+| `NGRAM_SIMPLE_DRAFT` | `1 << 26` | llama.cpp upstream `ngram-simple` proposal over accepted token history |
+| `NGRAM_CACHE_DRAFT` | `1 << 27` | Stateful request-local llama.cpp `ngram-cache` proposer |
 
 Runtime-event compatibility expectations are narrow on purpose:
 
@@ -212,6 +221,15 @@ hook currently bound by this crate.
 | `skippy_decode_step_sampled` | Decodes one token with `SamplingConfig`, including penalties and logit bias. |
 | `skippy_prefill_chunk_frame` | Prefills a token chunk using `ActivationDesc` plus payload buffers. |
 | `skippy_decode_step_frame_sampled` | Decodes one token with activation-frame I/O and `SamplingConfig`. |
+
+### Self-speculative proposal
+
+| Function | Purpose |
+| --- | --- |
+| `skippy_ngram_simple_draft` | Calls llama.cpp's upstream `ngram-simple` proposer with accepted history and returns only the proposed continuation. It owns no persistent cache state. |
+| `skippy_ngram_cache_create` / `free` | Allocates or releases a request-owned cache handle. |
+| `skippy_ngram_cache_reset` / `append` | Rebuilds or extends the cache with target-committed token history only. |
+| `skippy_ngram_cache_draft` | Drafts after committed history and an optional non-mutating continuation prefix, such as a native MTP candidate. |
 
 ### Token and chat helpers
 

@@ -922,7 +922,7 @@ fn active_stage_refresh_marks_missing_stage_failed() {
 }
 
 #[test]
-fn active_stage_refresh_timeout_marks_cached_stage_failed() {
+fn active_stage_missing_from_runtime_marks_cached_stage_failed() {
     let node_id = EndpointId::from(SecretKey::from_bytes(&[0x43; 32]).public());
     let mut state = StageTopologyState::default();
     state.record_status(test_stage_status(
@@ -934,7 +934,10 @@ fn active_stage_refresh_timeout_marks_cached_stage_failed() {
     ));
     let cached = state.active_statuses().into_iter().next().unwrap();
 
-    state.record_status_refresh_failure(&cached, "stage status refresh timed out".to_string());
+    state.record_status_refresh_failure(
+        &cached,
+        crate::mesh::stage_transport::StageStatusRefreshFailure::MissingFromRuntime,
+    );
 
     let status = state.runtime_statuses().into_iter().next().unwrap();
     assert_eq!(
@@ -943,8 +946,37 @@ fn active_stage_refresh_timeout_marks_cached_stage_failed() {
     );
     assert_eq!(
         status.error.as_deref(),
-        Some("stage status refresh timed out")
+        Some("stage status missing from runtime")
     );
+}
+
+#[test]
+fn active_stage_refresh_timeout_retains_cached_stage_status() {
+    // A transient refresh failure (timeout / unreachable peer) must retain the
+    // last-known Ready status rather than tearing down a healthy split on a
+    // momentary blip.
+    let node_id = EndpointId::from(SecretKey::from_bytes(&[0x43; 32]).public());
+    let mut state = StageTopologyState::default();
+    state.record_status(test_stage_status(
+        node_id,
+        "stage-1",
+        1,
+        "127.0.0.1:51234",
+        crate::inference::skippy::StageRuntimeState::Ready,
+    ));
+    let cached = state.active_statuses().into_iter().next().unwrap();
+
+    state.record_status_refresh_failure(
+        &cached,
+        crate::mesh::stage_transport::StageStatusRefreshFailure::Transient,
+    );
+
+    let status = state.runtime_statuses().into_iter().next().unwrap();
+    assert_eq!(
+        status.state,
+        crate::inference::skippy::StageRuntimeState::Ready
+    );
+    assert_eq!(status.error, None);
 }
 
 #[test]

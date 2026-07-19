@@ -11,7 +11,7 @@ use skippy_runtime::{
     parse_cache_type,
 };
 
-use crate::cli::VerifySpanLocalArgs;
+use crate::cli::VerifyWindowLocalArgs;
 
 #[derive(Debug, Serialize)]
 struct TimingStats {
@@ -35,7 +35,7 @@ struct TimingShape {
 }
 
 #[derive(Debug, Serialize)]
-struct VerifySpanLocalReport {
+struct VerifyWindowLocalReport {
     mode: &'static str,
     model_path: PathBuf,
     layer_end: u32,
@@ -90,7 +90,7 @@ struct SplitTimingDiagnostics {
     serial_stage1: TimingShape,
 }
 
-pub fn verify_span_local(args: VerifySpanLocalArgs) -> Result<()> {
+pub fn verify_window_local(args: VerifyWindowLocalArgs) -> Result<()> {
     validate_args(&args)?;
     let output = args.output.clone();
     let full = run_full_model_samples(&args)?;
@@ -115,7 +115,7 @@ pub fn verify_span_local(args: VerifySpanLocalArgs) -> Result<()> {
     Ok(())
 }
 
-fn validate_args(args: &VerifySpanLocalArgs) -> Result<()> {
+fn validate_args(args: &VerifyWindowLocalArgs) -> Result<()> {
     if args.layer_end == 0 {
         bail!("layer_end must be greater than zero");
     }
@@ -130,7 +130,7 @@ fn validate_args(args: &VerifySpanLocalArgs) -> Result<()> {
     Ok(())
 }
 
-fn full_runtime_config(args: &VerifySpanLocalArgs) -> Result<RuntimeConfig> {
+fn full_runtime_config(args: &VerifyWindowLocalArgs) -> Result<RuntimeConfig> {
     Ok(RuntimeConfig {
         stage_index: 0,
         layer_start: 0,
@@ -162,7 +162,7 @@ struct FullModelSamples {
     samples: SampleSet,
 }
 
-fn run_full_model_samples(args: &VerifySpanLocalArgs) -> Result<FullModelSamples> {
+fn run_full_model_samples(args: &VerifyWindowLocalArgs) -> Result<FullModelSamples> {
     let config = full_runtime_config(args)?;
     let model = StageModel::open(&args.model_path, &config)
         .with_context(|| format!("failed to open {}", args.model_path.display()))?;
@@ -364,7 +364,7 @@ fn measure_batched(
     let start = Instant::now();
     let prediction = session
         .verify_tokens_frame_sampled(verify_tokens, Some(&SamplingConfig::default()), None, 0)
-        .context("batched width-2 VerifySpan failed")?
+        .context("batched width-2 VerifyWindow failed")?
         .0;
     Ok((start.elapsed(), prediction))
 }
@@ -383,7 +383,7 @@ fn measure_serial(
 }
 
 fn run_split_inprocess_samples(
-    args: &VerifySpanLocalArgs,
+    args: &VerifyWindowLocalArgs,
     split_layer: u32,
     tokens: &[i32],
     verify_tokens: &[i32],
@@ -416,7 +416,7 @@ fn run_split_inprocess_samples(
 }
 
 fn split_runtime_configs(
-    args: &VerifySpanLocalArgs,
+    args: &VerifyWindowLocalArgs,
     split_layer: u32,
 ) -> Result<(RuntimeConfig, RuntimeConfig)> {
     let cache_type_k = parse_cache_type(&args.cache_type_k)?;
@@ -567,11 +567,11 @@ fn measure_split_batched(
     let stage0_start = Instant::now();
     let (_stage0_prediction, boundary) = session0
         .verify_tokens_frame_sampled(verify_tokens, Some(&SamplingConfig::default()), None, 0)
-        .context("in-process split stage 0 VerifySpan failed")?;
+        .context("in-process split stage 0 VerifyWindow failed")?;
     let stage0 = stage0_start.elapsed();
     let boundary_payload_bytes = boundary.payload.len();
     if boundary_payload_bytes == 0 {
-        bail!("in-process split stage 0 produced an empty VerifySpan activation frame");
+        bail!("in-process split stage 0 produced an empty VerifyWindow activation frame");
     }
 
     let stage1_start = Instant::now();
@@ -582,7 +582,7 @@ fn measure_split_batched(
             Some(&boundary),
             0,
         )
-        .context("in-process split stage 1 VerifySpan failed")?
+        .context("in-process split stage 1 VerifyWindow failed")?
         .0;
     let stage1 = stage1_start.elapsed();
     Ok(SplitSample {
@@ -758,16 +758,16 @@ impl SampleSet {
 }
 
 fn build_report(
-    args: VerifySpanLocalArgs,
+    args: VerifyWindowLocalArgs,
     full: FullModelSamples,
     split_inprocess_width2: Option<SplitInprocessReport>,
-) -> Result<VerifySpanLocalReport> {
+) -> Result<VerifyWindowLocalReport> {
     let batched_width2 = timing_stats(&full.samples.batched)?;
     let serial_two_decode_mtp_n1 = timing_stats(&full.samples.serial)?;
     let batched_avg = batched_width2.avg_us;
     let serial_avg = serial_two_decode_mtp_n1.avg_us;
-    Ok(VerifySpanLocalReport {
-        mode: "verify-span-local",
+    Ok(VerifyWindowLocalReport {
+        mode: "verify-window-local",
         model_path: args.model_path,
         layer_end: args.layer_end,
         split_layer: args.split_layer,

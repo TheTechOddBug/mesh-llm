@@ -1,7 +1,7 @@
 use super::{
     binary_full_prefill_record_identities, decode_record_tokens_sideband,
-    is_decode_frame_batch_candidate, native_mtp_enabled_from, prepare_binary_stage_connection,
-    restore_prefill_decode_as_decode_message, token_sideband_or_fill,
+    is_decode_frame_batch_candidate, prepare_binary_stage_connection, reply_window_for_message,
+    restore_prefill_decode_as_decode_message, split_native_mtp_reply, token_sideband_or_fill,
     warm_downstream_preconnect_enabled_from,
 };
 use std::{
@@ -52,16 +52,6 @@ fn accepted_binary_stage_connection_is_blocking() {
     assert_ne!(flags, -1);
     assert_eq!(flags & libc::O_NONBLOCK, 0);
     drop(client.join().unwrap());
-}
-
-#[test]
-fn native_mtp_enabled_flag_defaults_on_and_accepts_false_values() {
-    assert!(native_mtp_enabled_from(None));
-    assert!(native_mtp_enabled_from(Some("1")));
-    assert!(native_mtp_enabled_from(Some("true")));
-    assert!(!native_mtp_enabled_from(Some("0")));
-    assert!(!native_mtp_enabled_from(Some("false")));
-    assert!(!native_mtp_enabled_from(Some(" disabled ")));
 }
 
 #[test]
@@ -119,22 +109,22 @@ fn stale_warm_downstream_connection_is_replaced() {
 }
 
 #[test]
-fn request_summary_tracks_verify_span_compute_ms() {
+fn request_summary_tracks_verify_window_compute_ms() {
     let config = prefix_cache_test_config();
     let mut summary = super::BinaryRequestSummary::default();
-    let verify = test_message(WireMessageKind::VerifySpan, 2);
+    let verify = test_message(WireMessageKind::VerifyWindow, 2);
     let decode = test_message(WireMessageKind::DecodeEmbd, 1);
 
     summary.observe(summary_observation(&config, &verify, 12.5));
     summary.observe(summary_observation(&config, &decode, 7.0));
 
-    assert_eq!(summary.verify_span_count, 1);
-    assert_eq!(summary.verify_span_token_count, 2);
-    assert_eq!(summary.verify_span_max_tokens, 2);
-    assert_eq!(summary.verify_span_compute_ms, 12.5);
-    assert_eq!(summary.verify_span_input_activation_decode_ms, 1.25);
-    assert_eq!(summary.verify_span_runtime_lock_hold_ms, 2.5);
-    assert_eq!(summary.verify_span_upstream_reply_ms, 0.75);
+    assert_eq!(summary.verify_window_count, 1);
+    assert_eq!(summary.verify_window_token_count, 2);
+    assert_eq!(summary.verify_window_max_tokens, 2);
+    assert_eq!(summary.verify_window_compute_ms, 12.5);
+    assert_eq!(summary.verify_window_input_activation_decode_ms, 1.25);
+    assert_eq!(summary.verify_window_runtime_lock_hold_ms, 2.5);
+    assert_eq!(summary.verify_window_upstream_reply_ms, 0.75);
     assert_eq!(summary.compute_ms, 19.5);
     assert_eq!(summary.input_activation_decode_ms, 2.5);
     assert_eq!(summary.runtime_lock_hold_ms, 5.0);
@@ -142,10 +132,51 @@ fn request_summary_tracks_verify_span_compute_ms() {
 }
 
 #[test]
+fn verify_window_reply_reports_accepted_prefix_and_correction() {
+    let mut message = test_message(WireMessageKind::VerifyWindow, 3);
+    message.state.seq_id = 42;
+    message.tokens = vec![10, 11, 12];
+
+    let reply = reply_window_for_message(&message, &[11, 99, 100]);
+
+    assert_eq!(reply.window_id, 42);
+    assert_eq!(reply.accepted_len, 1);
+    assert_eq!(reply.correction_token, 99);
+}
+
+#[test]
+fn native_mtp_sideband_is_removed_from_verify_predictions() {
+    let mut message = test_message(WireMessageKind::VerifyWindow, 3);
+    message.tokens = vec![10, 11, 12];
+    let mut predictions = vec![11, 12, 13, 2, 14, 15, 123];
+
+    let draft = split_native_mtp_reply(&message, &mut predictions).unwrap();
+
+    assert_eq!(predictions, vec![11, 12, 13]);
+    assert_eq!(
+        draft,
+        Some(skippy_protocol::binary::StageNativeMtpDraft {
+            token_ids: vec![14, 15],
+            proposal_compute_us: 123,
+        })
+    );
+}
+
+#[test]
+fn malformed_native_mtp_sideband_is_rejected() {
+    let message = test_message(WireMessageKind::DecodeEmbd, 1);
+    let mut predictions = vec![11, 2, 12];
+
+    let error = split_native_mtp_reply(&message, &mut predictions).unwrap_err();
+
+    assert!(error.to_string().contains("malformed native MTP sideband"));
+}
+
+#[test]
 fn request_summary_tracks_auto_align_totals() {
     let config = prefix_cache_test_config();
     let mut summary = super::BinaryRequestSummary::default();
-    let verify = test_message(WireMessageKind::VerifySpan, 2);
+    let verify = test_message(WireMessageKind::VerifyWindow, 2);
     let decode = test_message(WireMessageKind::DecodeEmbd, 1);
 
     let mut verify_observation = summary_observation(&config, &verify, 12.5);
@@ -163,9 +194,9 @@ fn request_summary_tracks_auto_align_totals() {
     assert_eq!(summary.session_auto_align_count, 2);
     assert_eq!(summary.session_auto_align_ms, 2.0);
     assert_eq!(summary.session_auto_align_trimmed_tokens, 3);
-    assert_eq!(summary.verify_span_session_auto_align_count, 1);
-    assert_eq!(summary.verify_span_session_auto_align_ms, 0.75);
-    assert_eq!(summary.verify_span_session_auto_align_trimmed_tokens, 1);
+    assert_eq!(summary.verify_window_session_auto_align_count, 1);
+    assert_eq!(summary.verify_window_session_auto_align_ms, 0.75);
+    assert_eq!(summary.verify_window_session_auto_align_trimmed_tokens, 1);
 }
 
 #[test]
@@ -342,10 +373,10 @@ fn summary_observation<'a>(
         session_auto_align_count: 0,
         session_auto_align_ms: 0.0,
         session_auto_align_trimmed_tokens: 0,
-        verify_span_pre_compute_ms: 0.25,
-        verify_span_post_compute_ms: 0.5,
-        verify_span_pre_reply_ms: 0.0,
-        verify_span_after_reply_ms: 0.0,
+        verify_window_pre_compute_ms: 0.25,
+        verify_window_post_compute_ms: 0.5,
+        verify_window_pre_reply_ms: 0.0,
+        verify_window_after_reply_ms: 0.0,
         upstream_message_wait_ms: 0.0,
     }
 }
