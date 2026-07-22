@@ -32,7 +32,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::json;
 use skippy_protocol::binary::{WireMessageKind, read_stage_message, send_ready};
 
-mod async_forwarder;
+pub(in crate::binary_transport) mod async_forwarder;
 mod connection;
 pub(in crate::binary_transport) mod reply;
 mod summary;
@@ -159,18 +159,6 @@ fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> R
                 adaptive_speculative_window: openai_options.adaptive_speculative_window,
                 draft_n_gpu_layers: openai_options.draft_n_gpu_layers,
                 speculative: openai_options.speculative.clone(),
-                ngram_min: openai_options
-                    .speculative
-                    .ngram
-                    .as_ref()
-                    .filter(|ngram| ngram.kind == frontend::NgramProposerKind::Simple)
-                    .map_or(0, |ngram| ngram.min_ngram),
-                ngram_max: openai_options
-                    .speculative
-                    .ngram
-                    .as_ref()
-                    .filter(|ngram| ngram.kind == frontend::NgramProposerKind::Simple)
-                    .map_or(0, |ngram| ngram.max_proposal_tokens.min(ngram.max_ngram)),
                 native_mtp_enabled: native_mtp_enabled
                     && openai_options.speculative.native_mtp.enabled,
                 native_mtp_draft_model_path: None,

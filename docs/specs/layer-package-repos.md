@@ -720,22 +720,20 @@ without changing the MTP source:
       "primary": "mtp",
       "extender": "cache",
       "extension_policy": {
-        "initial_tokens": 2,
-        "max_tokens": 8,
-        "tail_backoff_proposals": 5
+        "max_tokens": 8
       }
     }
   }
 }
 ```
 
-Supported proposer types are `native-mtp`, `ngram-simple`, and
-`ngram-cache`. An `ngram-cache` proposer MUST use `history_scope: "request"`
+Supported proposer types are `native-mtp` and `ngram-cache`. An
+`ngram-cache` proposer MUST use `history_scope: "request"`
 and `ngram_max` no greater than `4`, llama.cpp's current cache match-window
 limit. It contains only target-committed history for one request and is never shared
 between users or sessions. A `composite` strategy MUST use a `native-mtp`
-primary and an N-gram extender. Its `extension_policy` bounds the adaptive
-tail; every combined candidate is still verified by one target VerifyWindow.
+primary and an N-gram extender. Its `extension_policy` bounds the fixed
+request-local continuation horizon; every combined candidate is target-verified.
 
 The package schema separates a proposer match length from its output budget:
 
@@ -746,23 +744,19 @@ The package schema separates a proposer match length from its output budget:
 | `ngram_min` / `ngram_max` | N-gram proposers | Define the historical token match range. Both are required and `ngram_min <= ngram_max`. |
 | `max_proposal_tokens` | N-gram proposers | Caps how many continuation tokens the proposer may return. It is independent of `ngram_max`. |
 | `history_scope` | `ngram-cache` | Must be `"request"`; a cache proposer never observes another request's tokens. |
-| `initial_tokens` / `max_tokens` | composite extension policy | Bound the adaptive N-gram tail after an MTP prefix. |
-| `tail_backoff_proposals` | composite extension policy | Sets how many proposals to back off after an unhelpful tail. |
+| `max_tokens` | composite extension policy | Bounds the N-gram continuation horizon after an MTP prefix. |
 
-`ngram-simple` looks up continuations in the accepted prompt/history. It can
-be published for any compatible tokenizer. `ngram-cache` is a request-local
-incremental lookup that can also start after a provisional MTP prefix; its
+`ngram-cache` is a request-local incremental lookup that starts after a
+provisional MTP prefix; its
 match window is intentionally capped at four tokens by the current llama.cpp
-ABI. Neither N-gram proposer is authoritative: the target verifies the MTP
+ABI. The N-gram proposer is not authoritative: the target verifies the MTP
 prefix and N-gram suffix together, then commits the accepted prefix only.
 
-Packages that expose the full product menu SHOULD use stable strategy ids:
-`mtp`, `ngram-simple`, `ngram-cache`, `mtp-simple`, and `mtp-cache`. `mtp`
-may reference a reusable `native-mtp` proposer instead of repeating its
-prediction-depth and layer metadata. The N-gram-only names use `proposer`; the
-two composite names use that MTP proposer as `primary` and the corresponding
-N-gram proposer as `extender`. `disabled` is a runtime/operator baseline, not
-a package strategy.
+Packages SHOULD use `mtp` for native MTP and `mtp-cache` for the composite.
+`mtp` may reference a reusable `native-mtp` proposer instead of repeating its
+prediction-depth and layer metadata. `mtp-cache` uses that proposer as
+`primary` and a request-local `ngram-cache` proposer as `extender`. `disabled`
+is a runtime/operator baseline, not a package strategy.
 
 Native MTP strategy rules:
 
@@ -790,13 +784,10 @@ package strategy such as `mtp-cache` is accepted only when the selected package
 declares it. Precedence is CLI invocation, selected model entry, then global
 defaults. These layers may bound N-gram proposal size, extension depth,
 cooldown, and VerifyWindow depth. A named package strategy cannot be invented
-outside its package. For direct GGUF operation, operators may explicitly select
-the built-in `ngram-simple` or request-local `ngram-cache` proposer by supplying
-valid N-gram bounds; mesh-llm constructs and validates that generic plan before
-starting Skippy. `skippy-server` receives the resulting typed plan and does not
-repeat this policy resolution.
-
-Operators may also pass the legacy `native-mtp-n1` value; the runtime normalizes it to `mtp` for backward compatibility. New configs should use `mtp`.
+outside its package. For direct GGUF operation, operators combine
+`strategy = "mtp"` with valid N-gram bounds; mesh-llm constructs and validates
+the composite plan before starting Skippy. `skippy-server` receives the
+resulting typed plan and does not repeat this policy resolution.
 
 See [Speculative Decode Configuration](../skippy/PIPELINED_VERIFY_WINDOW.md#operator-configuration)
 for the operator-side `config.toml` controls and CLI equivalents. Package

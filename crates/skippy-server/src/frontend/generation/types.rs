@@ -52,8 +52,6 @@ pub(in crate::frontend) struct StageOpenAiBackend {
     pub(in crate::frontend) draft: Option<Arc<Mutex<DraftRunner>>>,
     pub(in crate::frontend) speculative_window: usize,
     pub(in crate::frontend) adaptive_speculative_window: bool,
-    pub(in crate::frontend) ngram_min: usize,
-    pub(in crate::frontend) ngram_max: usize,
     pub(in crate::frontend) speculative: SpeculativeDecodeConfig,
     pub(in crate::frontend) generation_limit: Arc<Semaphore>,
     pub(in crate::frontend) generation_queue_depth: Arc<AtomicUsize>,
@@ -87,10 +85,6 @@ impl OpenAiBackendMode {
             Self::LocalRuntime => "local-runtime",
             Self::EmbeddedStageZero { .. } => "embedded-stage0",
         }
-    }
-
-    pub(in crate::frontend) fn reserves_local_kv_tokens(&self) -> bool {
-        matches!(self, Self::LocalRuntime)
     }
 }
 
@@ -152,8 +146,6 @@ pub(in crate::frontend) struct EmbeddedStageZeroGeneration<'a> {
     pub(in crate::frontend) draft: Option<Arc<Mutex<DraftRunner>>>,
     pub(in crate::frontend) speculative_window: usize,
     pub(in crate::frontend) adaptive_speculative_window: bool,
-    pub(in crate::frontend) ngram_min: usize,
-    pub(in crate::frontend) ngram_max: usize,
     pub(in crate::frontend) speculative: &'a SpeculativeDecodeConfig,
     pub(in crate::frontend) native_mtp_enabled: bool,
     pub(in crate::frontend) prompt_token_ids: &'a [i32],
@@ -215,13 +207,6 @@ pub(in crate::frontend) struct EmbeddedFusedFirstDecode {
     pub(in crate::frontend) elapsed_ms: f64,
     pub(in crate::frontend) token_phase: &'static str,
     pub(in crate::frontend) message_kind: &'static str,
-}
-
-pub(in crate::frontend) struct EmbeddedSessionControl {
-    pub(in crate::frontend) elapsed_ms: f64,
-    pub(in crate::frontend) local_ms: f64,
-    pub(in crate::frontend) downstream_write_ms: f64,
-    pub(in crate::frontend) downstream_wait_ms: f64,
 }
 
 pub(in crate::frontend) struct GeneratedText {
@@ -292,7 +277,7 @@ impl GeneratedText {
         if let Some(telemetry) = self.native_mtp_decode_telemetry {
             telemetry.insert_response_timings(&mut timings);
         }
-        if let Some(stats) = self.verify_window_pipeline_stats {
+        if let Some(stats) = self.verify_window_pipeline_stats.as_ref() {
             stats.insert_response_timings(&mut timings);
         }
         if let Some(stats) = self.speculative_stats.as_ref() {
